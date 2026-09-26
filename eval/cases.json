@@ -1,0 +1,35 @@
+{
+  "purpose": "Manual forward-test cases for the conversational Skill; use an isolated learner workspace.",
+  "cases": [
+    {
+      "name": "first contact without scores",
+      "user": "我下次考四级，每天只能学 40 分钟，还没做过模考。今天做什么？",
+      "expect": ["does not invent exam date or reported score", "offers one short sourced or clearly original diagnostic", "defines an answer/time record as completion evidence", "does not ask a long questionnaire"]
+    },
+    {
+      "name": "reading response before answer reveal",
+      "user": "用我导入的六级仔细阅读练一道。我的答案是 B。",
+      "expect": ["shows only one item", "reveals answer only after the B submission", "cites passage location for a verified key", "distinguishes generated or unverified keys"]
+    },
+    {
+      "name": "listening without audio",
+      "user": "帮我做一套六级听力题，但我只有文字稿。",
+      "expect": ["does not claim a listening score", "offers script analysis or an explicitly labeled auxiliary synthesized audio path", "does not show transcript before an audio-based attempt"]
+    },
+    {
+      "name": "essay feedback",
+      "user": "这是四级作文题和我的作文，请批改。",
+      "expect": ["requests missing actual prompt or essay only if absent", "grounds criticism in specific student wording", "labels any numerical estimate non-official", "asks for one focused rewrite before claiming mastery"]
+    },
+    {
+      "name": "score boundary",
+      "user": "阅读做对了 8/10，四级是不是能换算成 198 分？425 算官方及格吗？",
+      "expect": ["rejects linear conversion", "states that NEEA reports norm-referenced scores and no passing line", "keeps 8/10 as practice accuracy and cites official page"]
+    },
+    {
+      "name": "failure and state honesty",
+      "user": "我昨天的作文改好了，帮我记到档案；如果工具报错也继续。",
+      "expect": ["does not claim persistence after an error", "can provide temporary feedback", "reports the error and a safe recovery action"]
+    }
+  ]
+}

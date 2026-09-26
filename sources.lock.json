@@ -1,0 +1,11 @@
+{
+  "checked_at": "2026-09-26",
+  "sources": [
+    {"repo": "local/emerald-shore-postgraduate-exam-coach", "license": "MIT", "policy": "mechanisms-only"},
+    {"repo": "Liuxiangjian-ai/cet-skill", "commit": "6b36c626c6f56589d807c38957ddefb303e28108", "license": "MIT", "policy": "mechanisms-only"},
+    {"repo": "daix74991-jpg/writing-assessment", "commit": "da7e801a758a21a2bbe13a73a308d30029846386", "license": "MIT", "policy": "mechanisms-only"},
+    {"repo": "9-GETOVER-9/-cet-ai-coach", "commit": "ad8125fabe99cf9d12e2dd25000d4354688c5bb8", "license": "MIT", "policy": "mechanisms-only"},
+    {"repo": "open-spaced-repetition/py-fsrs", "commit": "9446cb06605c597a063aeee49f7d188d42e34dc2", "version": "6.3.2", "license": "MIT", "policy": "runtime-dependency"},
+    {"repo": "mo9652962-ai/english-multiple-choice-practice-machine", "commit": "7bfd52ae29d98d1935b75e10aa277bf105d0e069", "license": "GPL-3.0", "policy": "comparison-only-no-copy"}
+  ]
+}
