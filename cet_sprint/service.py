@@ -19,6 +19,7 @@ from .materials import (
     validate_audio,
     validate_file,
 )
+from .quality import validate_item_quality
 from .scheduling import fsrs_status, next_review
 from .storage import (
     SCHEMA_VERSION,
@@ -448,6 +449,17 @@ def _add_item_conn(
             "写作和翻译没有单一标准答案。",
             "将参考文本标为 generated 或保持 unverified，批改时说明依据。",
         )
+    validate_item_quality(
+        section=section,
+        subtype=subtype,
+        prompt=prompt,
+        answer=answer,
+        answer_status=answer_status,
+        evidence=evidence,
+        transcript=transcript,
+        source_type=source_type,
+        material_text=material["extracted_text"] if material else "",
+    )
     audio = str(validate_audio(audio_path)) if audio_path else None
     if section != "listening" and (audio or transcript):
         raise CoachError(
@@ -677,6 +689,24 @@ def update_item(
             raise CoachError(
                 "audio_wrong_section", "音频和脚本只能绑定听力题。", "核对题目模块。"
             )
+        material_text = ""
+        if item["material_id"]:
+            material_row = conn.execute(
+                "SELECT extracted_text FROM materials WHERE id=?",
+                (item["material_id"],),
+            ).fetchone()
+            material_text = material_row[0] if material_row else ""
+        validate_item_quality(
+            section=item["section"],
+            subtype=item["subtype"],
+            prompt=item["prompt"],
+            answer=changes["answer"],
+            answer_status=changes["answer_status"],
+            evidence=changes["evidence"],
+            transcript=changes["transcript"],
+            source_type=item["source_type"],
+            material_text=material_text,
+        )
         with conn:
             conn.execute(
                 "UPDATE items SET answer=?,answer_status=?,evidence=?,locator=?,audio_path=?,transcript=?,active=? WHERE id=?",
@@ -1264,9 +1294,15 @@ def _focus_from_evidence(
     rows = [
         dict(row)
         for row in conn.execute(
-            """SELECT i.section,a.result,a.error_tag FROM attempts a
-           JOIN items i ON i.id=a.item_id WHERE a.made_at>=? AND i.level=?""",
-            (since, profile["level"]),
+            """SELECT * FROM (
+                 SELECT i.section,a.result,a.error_tag,a.made_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.item_id ORDER BY a.made_at,a.id
+                        ) AS attempt_number
+                 FROM attempts a JOIN items i ON i.id=a.item_id
+                 WHERE i.level=?
+               ) WHERE made_at>=?""",
+            (profile["level"], since),
         )
     ]
     by_section: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1274,18 +1310,21 @@ def _focus_from_evidence(
         if (
             row["section"] in {"listening", "reading", "writing", "translation"}
             and row["result"] != "unverified"
+            and row["attempt_number"] == 1
         ):
             by_section[row["section"]].append(row)
     candidates = []
     weights = {"listening": 0.35, "reading": 0.35, "writing": 0.15, "translation": 0.15}
     samples: dict[str, Any] = {}
     for section, events in by_section.items():
+        all_section_rows = [row for row in rows if row["section"] == section]
         minimum = 3 if section in {"listening", "reading"} else 1
         wrong = sum(event["result"] == "wrong" for event in events)
         partial = sum(event["result"] == "partial" for event in events)
-        tags = Counter(event["error_tag"] for event in events if event["error_tag"])
+        tags = Counter(row["error_tag"] for row in all_section_rows if row["error_tag"])
         samples[section] = {
-            "attempts": len(events),
+            "attempts": len(all_section_rows),
+            "new_items": len(events),
             "wrong": wrong,
             "partial": partial,
             "repeated_errors": {k: v for k, v in tags.items() if v >= 2},
@@ -1679,6 +1718,185 @@ def report(workspace: Path, *, days: int = 7) -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
+    """Interpret separate learning signals without inventing one efficiency score."""
+    summary = report(workspace, days=days)
+    conn = connect(workspace)
+    try:
+        require_profile(conn)
+        since = summary["since"]
+        attempts = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT * FROM (
+                     SELECT i.section,i.source_type,a.item_id,a.made_at,a.result,
+                            a.judgment_basis,a.error_tag,a.feedback,a.evidence,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY a.item_id ORDER BY a.made_at,a.id
+                            ) AS attempt_number
+                     FROM attempts a JOIN items i ON i.id=a.item_id
+                   ) WHERE made_at>=?""",
+                (since,),
+            )
+        ]
+        task_evidence = conn.execute(
+            "SELECT COUNT(*) FROM task_logs WHERE task_date>=? AND completed=1 AND evidence IS NOT NULL AND trim(evidence)!=''",
+            (since,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    verified = [
+        row
+        for row in attempts
+        if row["section"] in {"listening", "reading"}
+        and row["judgment_basis"] == "verified_key"
+    ]
+    generated = [
+        row
+        for row in attempts
+        if row["section"] in {"listening", "reading"}
+        and row["judgment_basis"] == "generated_key"
+    ]
+    fresh_verified = [row for row in verified if row["attempt_number"] == 1]
+    fresh_generated = [row for row in generated if row["attempt_number"] == 1]
+    subjective = [
+        row
+        for row in attempts
+        if row["section"] in {"writing", "translation"}
+        and row["judgment_basis"] == "coach_review"
+        and row["feedback"]
+        and row["evidence"]
+    ]
+    unverified = [row for row in attempts if row["result"] == "unverified"]
+    mocks = [row for row in summary["checkpoints"] if row["kind"] == "mock"]
+    official = [row for row in summary["checkpoints"] if row["kind"] == "official"]
+
+    def breakdown(
+        rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, int | float | None]]:
+        result: dict[str, dict[str, int | float | None]] = {}
+        for section in ("listening", "reading"):
+            events = [row for row in rows if row["section"] == section]
+            if events:
+                correct = sum(row["result"] == "correct" for row in events)
+                result[section] = {
+                    "correct": correct,
+                    "total": len(events),
+                    "raw_accuracy": round(correct / len(events), 3),
+                }
+        return result
+
+    verified_quality = breakdown(fresh_verified)
+    generated_quality = breakdown(fresh_generated)
+    planned = summary["execution"]["planned_tasks"]
+    completed = summary["execution"]["completed_tasks"]
+    execution_rate = round(completed / planned, 3) if planned else None
+
+    comparable: list[dict[str, Any]] = []
+    by_format: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for checkpoint in mocks:
+        if checkpoint["question_total"] and checkpoint["section"]:
+            by_format[(checkpoint["section"], checkpoint["question_total"])].append(
+                checkpoint
+            )
+    for (section, total), records in by_format.items():
+        if len(records) < 2:
+            continue
+        older, newer = records[-2:]
+        older_minutes, newer_minutes = older["minutes"], newer["minutes"]
+        if (
+            not older_minutes
+            or not newer_minutes
+            or abs(newer_minutes - older_minutes) / max(older_minutes, newer_minutes)
+            > 0.2
+        ):
+            continue
+        comparable.append(
+            {
+                "section": section,
+                "question_total": total,
+                "earlier_date": older["taken_on"],
+                "later_date": newer["taken_on"],
+                "earlier_raw_accuracy": round(older["correct"] / total, 3),
+                "later_raw_accuracy": round(newer["correct"] / total, 3),
+                "limit": "只核对了题型、题数和时长；试卷难度可能不同，不能据此预测报道分。",
+            }
+        )
+
+    low_accuracy = next(
+        (
+            section
+            for section, value in verified_quality.items()
+            if value["total"] >= 5 and value["raw_accuracy"] < 0.5
+        ),
+        None,
+    )
+    repeated = summary["repeated_error_tags"]
+    if (
+        planned == 0
+        and not official
+        and len(fresh_verified) + len(fresh_generated) + len(subjective) + len(mocks)
+        < 3
+    ):
+        diagnosis = (
+            "evidence_insufficient",
+            "先完成一组来源明确的限时题，并记录用时与错因。",
+        )
+    elif planned >= 3 and execution_rate is not None and execution_rate < 0.6:
+        diagnosis = (
+            "capacity_mismatch",
+            "下次只保留一个主攻任务，并按真实课表缩小计划。",
+        )
+    elif completed >= 2 and not (verified or generated or subjective or mocks):
+        diagnosis = ("input_heavy", "把下一次学习改成无提示作答，而不是继续只看材料。")
+    elif low_accuracy:
+        diagnosis = (
+            "accuracy_gap",
+            f"暂停扩量，先定位 {low_accuracy} 的一个决定性错因并换题复测。",
+        )
+    elif repeated:
+        diagnosis = ("recurring_error", "优先修复一个重复错因，再用新题检验是否复发。")
+    elif len(fresh_verified) >= 5 and not mocks:
+        diagnosis = (
+            "checkpoint_missing",
+            "安排同题型、有限时的检查点，检验日常练习是否转化。",
+        )
+    else:
+        diagnosis = ("loop_present", "保持当前主攻，继续积累同口径检查点和错因记录。")
+
+    return {
+        "window_days": days,
+        "since": since,
+        "execution": {**summary["execution"], "completion_rate": execution_rate},
+        "effective_evidence": {
+            "verified_key_attempts": len(verified),
+            "new_verified_questions": len(fresh_verified),
+            "original_generated_key_attempts": len(generated),
+            "new_original_questions": len(fresh_generated),
+            "review_attempts": sum(row["attempt_number"] > 1 for row in attempts),
+            "supported_writing_translation_reviews": len(subjective),
+            "timed_mock_checkpoints": len(mocks),
+            "official_score_reports": len(official),
+            "completed_tasks_with_evidence": task_evidence,
+            "unverified_attempts": len(unverified),
+        },
+        "independent_answer_quality": {
+            "verified_source_questions": verified_quality,
+            "original_practice_questions": generated_quality,
+        },
+        "repeated_error_tags": repeated,
+        "comparable_mock_pairs": comparable,
+        "diagnosis": {"code": diagnosis[0], "next_action": diagnosis[1]},
+        "limits": [
+            "只统计已记录行为；未记录的学习不等于没有发生。",
+            "原创题结果与已核验来源题分开，写译教练反馈不换算官方分。",
+            "独立作答质量只用每题首次作答；重做原题单列为复习尝试。",
+            "没有同口径限时检查点时，不能宣称考试表现提升。",
+        ],
+    }
 
 
 def export_state(

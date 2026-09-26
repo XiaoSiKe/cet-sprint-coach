@@ -6,6 +6,9 @@
     {"repo": "daix74991-jpg/writing-assessment", "commit": "da7e801a758a21a2bbe13a73a308d30029846386", "license": "MIT", "policy": "mechanisms-only"},
     {"repo": "9-GETOVER-9/-cet-ai-coach", "commit": "ad8125fabe99cf9d12e2dd25000d4354688c5bb8", "license": "MIT", "policy": "mechanisms-only"},
     {"repo": "open-spaced-repetition/py-fsrs", "commit": "9446cb06605c597a063aeee49f7d188d42e34dc2", "version": "6.3.2", "license": "MIT", "policy": "runtime-dependency"},
+    {"repo": "LUOLIN926/exam-clock", "commit": "21fc2141a49c2517416440ae28701586ae93fe9d", "license": "MIT", "policy": "mechanisms-only"},
+    {"repo": "ankitects/anki", "commit": "1f7c8d7c4c402da06ab10b8f5d0acca6d5abf748", "license": "AGPL-3.0-or-later", "policy": "comparison-only-no-copy"},
+    {"repo": "languagetool-org/languagetool", "commit": "e653ff4bd3244251defe68e71fbf54bbc2afb279", "license": "LGPL-2.1", "policy": "comparison-only-no-copy"},
     {"repo": "mo9652962-ai/english-multiple-choice-practice-machine", "commit": "7bfd52ae29d98d1935b75e10aa277bf105d0e069", "license": "GPL-3.0", "policy": "comparison-only-no-copy"}
   ]
 }

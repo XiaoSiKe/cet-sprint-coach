@@ -1,7 +1,7 @@
 [project]
 name = "cet-sprint-coach-engine"
-version = "1.1.0"
-description = "Local state engine for a CET-4/CET-6 coaching skill"
+version = "1.2.0"
+description = "Local engine for 青岸计划·四六级英语考试冲刺教练"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "fsrs==6.3.2",

@@ -1,4 +1,4 @@
 interface:
-  display_name: "四六级英语冲刺教练"
-  short_description: "用真实练习证据制定四级、六级笔试冲刺计划"
-  default_prompt: "用 $cet-sprint-coach 帮我准备大学英语四级或六级笔试，从当前材料和学习记录判断下一步。"
+  display_name: "青岸计划·四六级英语考试冲刺教练"
+  short_description: "以真实训练证据推进四六级笔试冲刺"
+  default_prompt: "用 $cet-sprint-coach 帮我准备大学英语四级或六级笔试，先看我的现实时间、材料和练习记录，再给今天的一个关键动作。"

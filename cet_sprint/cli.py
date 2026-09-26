@@ -232,6 +232,11 @@ def make_parser() -> argparse.ArgumentParser:
         "report", help="Separate execution, answers, errors and checkpoints"
     )
     report.add_argument("--days", type=int, default=7)
+    efficiency = commands.add_parser(
+        "efficiency",
+        help="Interpret execution and independent evidence without a composite score",
+    )
+    efficiency.add_argument("--days", type=int, default=7)
     export = commands.add_parser(
         "export", help="Write a readable JSON or Markdown export"
     )
@@ -429,6 +434,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return service.review(workspace, limit=args.limit)
     if args.command == "report":
         return service.report(workspace, days=args.days)
+    if args.command == "efficiency":
+        return service.efficiency(workspace, days=args.days)
     if args.command == "export":
         return service.export_state(
             workspace, format_name=args.format, output=args.output

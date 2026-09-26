@@ -498,6 +498,7 @@ class EngineFlowTests(unittest.TestCase):
             answer="B",
             answer_status="generated",
             transcript="Time is limited.",
+            evidence="Time is limited.",
         )
         with self.assertRaises(CoachError):
             service.drill(self.workspace, section="listening")

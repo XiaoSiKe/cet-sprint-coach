@@ -2,7 +2,7 @@
 
 ## 通用流程
 
-先 `drill --section ...` 取一题并显示来源与题型；到期复习先调用 `review`，再用返回的 `item_id` 调用 `drill --item-id ID` 精确取题。答案和听力脚本始终由引擎隐藏到学生作答后。学生提交答案后才 `attempt --response ...`；客观题有已核验单字母选项时引擎核对，其他情况由教练给出 `correct/partial/wrong/unverified` 和判断依据。没有可信答案只能反馈推理过程，不能声称官方判分。训练记录区分来源、用时与错因。连续三次 `wrong/partial` 停止加题，做一段最小讲解和新题复测。
+先 `drill --section ...` 取一题并显示来源与题型；到期复习先调用 `review`，再用返回的 `item_id` 调用 `drill --item-id ID` 精确取题。答案和听力脚本始终由引擎隐藏到学生作答后。原创题先按[出题与核验协议](item-authoring.md)检查。学生提交答案后才 `attempt --response ...`；客观题有已核验单字母选项时引擎核对，其他情况由教练给出 `correct/partial/wrong/unverified` 和判断依据。没有可信答案只能反馈推理过程，不能声称官方判分。训练记录区分来源、用时与错因。连续三次 `wrong/partial` 停止加题，做一段最小讲解和新题复测；方法选择见[学习科学](learning-science.md)。
 
 ## 听力
 
