@@ -836,7 +836,10 @@ def drill(
             for row in conn.execute(
                 f"""SELECT i.*, m.path AS material_path, m.year AS material_year,
                 m.source_url AS material_url, m.confidence AS material_confidence,
-                r.due_at AS due_at
+                r.due_at AS due_at,
+                (SELECT COUNT(*) FROM attempts a WHERE a.item_id=i.id) AS attempt_count,
+                (SELECT a.result FROM attempts a WHERE a.item_id=i.id
+                    ORDER BY a.made_at DESC, a.rowid DESC LIMIT 1) AS last_result
                 FROM items i LEFT JOIN materials m ON m.id=i.material_id
                 LEFT JOIN review_cards r ON r.item_id=i.id
                 WHERE {" AND ".join(clauses)}""",
@@ -856,23 +859,17 @@ def drill(
                 else "先导入或合成可播放音频并绑定听力题。"
             )
             raise CoachError("no_usable_item", f"{section} 暂无可训练题。", recovery)
-        attempts = defaultdict(list)
-        for row in conn.execute(
-            "SELECT item_id,result,made_at FROM attempts ORDER BY made_at DESC"
-        ):
-            attempts[row["item_id"]].append(row["result"])
         today = today_iso()
 
         def rank(row: dict[str, Any]) -> tuple[Any, ...]:
-            history = attempts[row["id"]]
             due = bool(row["due_at"] and row["due_at"] <= today)
-            wrong_recent = bool(history and history[0] in {"wrong", "partial"})
-            unseen = not history
+            wrong_recent = row["last_result"] in {"wrong", "partial"}
+            unseen = not row["attempt_count"]
             bucket = 0 if due else 1 if wrong_recent else 2 if unseen else 3
             return (
                 bucket,
                 row["due_at"] or "9999-12-31",
-                len(history),
+                row["attempt_count"],
                 row["created_at"],
                 row["id"],
             )
