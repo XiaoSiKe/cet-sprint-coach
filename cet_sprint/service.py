@@ -9,9 +9,12 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from datetime import date, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+from .alignment import alignment_delta, validate_alignment
 from .materials import (
     extract,
     sha256_file,
@@ -50,6 +53,7 @@ def doctor(workspace: Path) -> dict[str, Any]:
         pdf = {"available": False, "version": None}
     return {
         "python": sys.version.split()[0],
+        "engine_version": __version__,
         "schema_version": SCHEMA_VERSION,
         "state_exists": db_path(workspace).is_file(),
         "state_path": str(db_path(workspace)),
@@ -341,6 +345,65 @@ def list_materials(workspace: Path) -> dict[str, Any]:
         conn.close()
 
 
+def _audio_fingerprint(path: Path) -> str:
+    try:
+        return sha256_file(path)
+    except OSError as exc:
+        raise CoachError(
+            "audio_missing",
+            "无法读取绑定的音频文件。",
+            "恢复原文件或核对后重新绑定。",
+        ) from exc
+
+
+def _bind_audio(raw: str, material: dict[str, Any] | None) -> tuple[str, str]:
+    path = validate_audio(raw)
+    fingerprint = _audio_fingerprint(path)
+    if material and material["path"] == str(path) and material["sha256"] != fingerprint:
+        raise CoachError(
+            "audio_changed",
+            "当前音频与已登记来源的文件不一致。",
+            "恢复匹配的原音频；替代音频需单独核对来源和脚本。",
+        )
+    return str(path), fingerprint
+
+
+def _check_bound_audio(
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    fingerprints: dict[str, str] | None = None,
+) -> None:
+    raw = item.get("audio_path")
+    if not raw:
+        raise CoachError(
+            "audio_missing", "听力题尚未绑定音频。", "核对脚本后绑定可播放音频。"
+        )
+    actual = fingerprints.get(raw) if fingerprints is not None else None
+    if actual is None:
+        actual = _audio_fingerprint(Path(raw))
+        if fingerprints is not None:
+            fingerprints[raw] = actual
+    expected = item.get("audio_sha256")
+    if not expected and item.get("material_id"):
+        material = conn.execute(
+            "SELECT path,sha256 FROM materials WHERE id=?", (item["material_id"],)
+        ).fetchone()
+        if material and material["path"] == raw:
+            expected = material["sha256"]
+    if not expected:
+        raise CoachError(
+            "audio_binding_unverified",
+            "旧音频绑定缺少可核对的历史指纹。",
+            "核对音频、脚本和题目后，用 material item-update --audio-path 显式重绑。",
+        )
+    if actual != expected:
+        raise CoachError(
+            "audio_changed",
+            "音频同路径文件已变化，无法确认与原题匹配。",
+            "恢复校验一致的原音频，或核对来源和脚本后重新绑定。",
+        )
+
+
 def _add_item_conn(
     conn: sqlite3.Connection,
     profile: dict[str, Any],
@@ -460,13 +523,15 @@ def _add_item_conn(
         source_type=source_type,
         material_text=material["extracted_text"] if material else "",
     )
-    audio = str(validate_audio(audio_path)) if audio_path else None
-    if section != "listening" and (audio or transcript):
+    if section != "listening" and (audio_path or transcript):
         raise CoachError(
             "audio_wrong_section",
             "音频和脚本只能绑定听力题。",
             "改用 --section listening。",
         )
+    audio, fingerprint = (
+        _bind_audio(audio_path, material) if audio_path else (None, None)
+    )
     item_id = stable_id(
         "item",
         material_id or source_type,
@@ -481,7 +546,10 @@ def _add_item_conn(
     if existing:
         return {"added": False, "item_id": item_id, "duplicate": True}
     conn.execute(
-        "INSERT INTO items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        """INSERT INTO items(
+            id,material_id,level,section,subtype,prompt,answer,answer_status,evidence,locator,
+            audio_path,transcript,source_type,active,created_at,audio_sha256
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             item_id,
             material_id,
@@ -498,6 +566,7 @@ def _add_item_conn(
             source_type,
             1,
             now_iso(),
+            fingerprint,
         ),
     )
     return {
@@ -639,6 +708,25 @@ def update_item(
             raise CoachError(
                 "item_not_found", "找不到题目。", "用 material items 查看 ID。"
             )
+        material = (
+            row_dict(
+                conn.execute(
+                    "SELECT path,sha256,extracted_text FROM materials WHERE id=?",
+                    (item["material_id"],),
+                ).fetchone()
+            )
+            if item["material_id"]
+            else None
+        )
+        if audio_path and item["section"] != "listening":
+            raise CoachError(
+                "audio_wrong_section", "音频只能绑定听力题。", "核对题目模块。"
+            )
+        audio, fingerprint = (
+            _bind_audio(audio_path, material)
+            if audio_path
+            else (item["audio_path"], item["audio_sha256"])
+        )
         changes = {
             "answer": answer if answer is not None else item["answer"],
             "answer_status": answer_status
@@ -646,11 +734,10 @@ def update_item(
             else item["answer_status"],
             "evidence": evidence if evidence is not None else item["evidence"],
             "locator": locator if locator is not None else item["locator"],
-            "audio_path": str(validate_audio(audio_path))
-            if audio_path
-            else item["audio_path"],
+            "audio_path": audio,
             "transcript": transcript if transcript is not None else item["transcript"],
             "active": int(active) if active is not None else item["active"],
+            "audio_sha256": fingerprint,
         }
         if changes["answer_status"] == "verified" and (
             not changes["answer"] or not (changes["evidence"] or changes["locator"])
@@ -689,13 +776,7 @@ def update_item(
             raise CoachError(
                 "audio_wrong_section", "音频和脚本只能绑定听力题。", "核对题目模块。"
             )
-        material_text = ""
-        if item["material_id"]:
-            material_row = conn.execute(
-                "SELECT extracted_text FROM materials WHERE id=?",
-                (item["material_id"],),
-            ).fetchone()
-            material_text = material_row[0] if material_row else ""
+        material_text = material["extracted_text"] if material else ""
         validate_item_quality(
             section=item["section"],
             subtype=item["subtype"],
@@ -709,14 +790,21 @@ def update_item(
         )
         with conn:
             conn.execute(
-                "UPDATE items SET answer=?,answer_status=?,evidence=?,locator=?,audio_path=?,transcript=?,active=? WHERE id=?",
+                "UPDATE items SET answer=?,answer_status=?,evidence=?,locator=?,audio_path=?,transcript=?,active=?,audio_sha256=? WHERE id=?",
                 (*changes.values(), item_id),
             )
+        audio_issue = None
+        if item["section"] == "listening":
+            try:
+                _check_bound_audio(conn, {**item, **changes})
+            except CoachError as exc:
+                audio_issue = exc.code
         return {
             "item_id": item_id,
             "updated": True,
             "answer_status": changes["answer_status"],
-            "audio_ready": bool(changes["audio_path"]),
+            "audio_ready": item["section"] == "listening" and audio_issue is None,
+            "audio_error": audio_issue,
         }
     finally:
         conn.close()
@@ -756,6 +844,7 @@ def synthesize_item(workspace: Path, item_id: str) -> dict[str, Any]:
                 "用户材料请引用原音频。",
             )
         if item["audio_path"] and Path(item["audio_path"]).is_file():
+            _check_bound_audio(conn, item)
             return {
                 "item_id": item_id,
                 "audio_path": item["audio_path"],
@@ -766,7 +855,8 @@ def synthesize_item(workspace: Path, item_id: str) -> dict[str, Any]:
         synthesize_mac_audio(item["transcript"] or "", path)
         with conn:
             conn.execute(
-                "UPDATE items SET audio_path=? WHERE id=?", (str(path), item_id)
+                "UPDATE items SET audio_path=?,audio_sha256=? WHERE id=?",
+                (str(path), _audio_fingerprint(path), item_id),
             )
         return {
             "item_id": item_id,
@@ -784,9 +874,29 @@ def drill(
     section: str | None = None,
     subtype: str | None = None,
     item_id: str | None = None,
+    fresh: bool = False,
+    use_focus: bool = False,
 ) -> dict[str, Any]:
+    if use_focus:
+        if any((section, subtype, item_id)):
+            raise CoachError(
+                "focus_filter_conflict",
+                "主攻抽题不可与手动筛选同时使用。",
+                "使用 --focus，或单独提供 --section/--subtype/--item-id。",
+            )
+        current_plan = plan(workspace)
+        if not current_plan["focus"]:
+            raise CoachError(
+                "no_planned_focus",
+                "目前没有可沿用的主攻范围。",
+                "先根据 plan 的诊断或考试阶段说明决定下一步。",
+            )
+        section = current_plan["focus"]
+        subtype = (current_plan["focus_detail"] or {}).get("subtype")
     conn = connect(workspace)
     try:
+        # Rank candidates and read the chosen item from one database snapshot.
+        conn.execute("BEGIN")
         profile = require_profile(conn)
         if item_id:
             selected = row_dict(
@@ -831,50 +941,79 @@ def drill(
         if subtype:
             clauses.append("i.subtype=?")
             params.append(subtype)
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                f"""SELECT i.*, m.path AS material_path, m.year AS material_year,
-                m.source_url AS material_url, m.confidence AS material_confidence,
-                r.due_at AS due_at,
-                (SELECT COUNT(*) FROM attempts a WHERE a.item_id=i.id) AS attempt_count,
-                (SELECT a.result FROM attempts a WHERE a.item_id=i.id
-                    ORDER BY a.made_at DESC, a.rowid DESC LIMIT 1) AS last_result
-                FROM items i LEFT JOIN materials m ON m.id=i.material_id
-                LEFT JOIN review_cards r ON r.item_id=i.id
-                WHERE {" AND ".join(clauses)}""",
-                params,
+        scope = " AND ".join(clauses)
+        candidate_filter = scope
+        history_columns = """
+            (SELECT COUNT(*) FROM attempts a WHERE a.item_id=i.id) AS attempt_count,
+            (SELECT a.result FROM attempts a WHERE a.item_id=i.id
+                ORDER BY a.made_at DESC,a.rowid DESC LIMIT 1) AS last_result
+        """
+        if fresh:
+            candidate_filter += (
+                " AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.item_id=i.id)"
             )
-        ]
-        if section == "listening":
-            rows = [
-                row
-                for row in rows
-                if row["audio_path"] and Path(row["audio_path"]).is_file()
-            ]
-        if not rows:
+            history_columns = "0 AS attempt_count, NULL AS last_result"
+        limit = "" if section == "listening" else "LIMIT 1"
+        candidates = conn.execute(
+            f"""WITH candidates AS (
+                SELECT i.id,i.created_at,r.due_at,{history_columns}
+                FROM items i LEFT JOIN review_cards r ON r.item_id=i.id
+                WHERE {candidate_filter}
+            )
+            SELECT id FROM candidates
+            ORDER BY CASE
+                WHEN due_at<>'' AND due_at<=? THEN 0
+                WHEN last_result IN ('wrong','partial') THEN 1
+                WHEN attempt_count=0 THEN 2
+                ELSE 3
+            END, COALESCE(NULLIF(due_at,''),'9999-12-31'),attempt_count,created_at,id
+            {limit}""",
+            [*params, today_iso()],
+        )
+        first = candidates.fetchone()
+        if first is None:
+            if (
+                fresh
+                and conn.execute(
+                    f"SELECT 1 FROM items i WHERE {scope} LIMIT 1", params
+                ).fetchone()
+            ):
+                raise CoachError(
+                    "no_fresh_item",
+                    "该范围内没有尚未作答的可训练题。",
+                    "导入同题型新题，或经学生同意重做旧题。",
+                )
             recovery = (
                 "先用 material item-add 建一题。"
                 if section != "listening"
                 else "先导入或合成可播放音频并绑定听力题。"
             )
             raise CoachError("no_usable_item", f"{section} 暂无可训练题。", recovery)
-        today = today_iso()
 
-        def rank(row: dict[str, Any]) -> tuple[Any, ...]:
-            due = bool(row["due_at"] and row["due_at"] <= today)
-            wrong_recent = row["last_result"] in {"wrong", "partial"}
-            unseen = not row["attempt_count"]
-            bucket = 0 if due else 1 if wrong_recent else 2 if unseen else 3
-            return (
-                bucket,
-                row["due_at"] or "9999-12-31",
-                row["attempt_count"],
-                row["created_at"],
-                row["id"],
+        fingerprints: dict[str, str] = {}
+        first_failure = None
+        for candidate in chain((first,), candidates):
+            item = dict(
+                conn.execute(
+                    """SELECT i.id,i.level,i.section,i.subtype,i.prompt,i.answer_status,i.locator,
+                          i.source_type,i.audio_path,i.audio_sha256,i.material_id,
+                          m.path AS material_path,m.year AS material_year,
+                          m.source_url AS material_url,m.confidence AS material_confidence
+                   FROM items i LEFT JOIN materials m ON m.id=i.material_id WHERE i.id=?""",
+                    (candidate["id"],),
+                ).fetchone()
             )
-
-        item = min(rows, key=rank)
+            if section == "listening":
+                try:
+                    _check_bound_audio(conn, item, fingerprints)
+                except CoachError as exc:
+                    if first_failure is None:
+                        first_failure = exc
+                    continue
+            break
+        else:
+            assert first_failure is not None
+            raise first_failure
         source = {
             "type": item["source_type"],
             "material_path": item["material_path"],
@@ -901,6 +1040,132 @@ def drill(
         conn.close()
 
 
+# Filter the reporting window first, then use the item/date index to find the
+# first attempt across all history. Rowid breaks ties in insertion order.
+FIRST_ATTEMPT_SQL = """a.rowid = (
+    SELECT first.rowid FROM attempts first WHERE first.item_id=a.item_id
+    ORDER BY first.made_at,first.rowid LIMIT 1
+)"""
+
+
+def _same_error_streak(
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    attempt_id: str,
+    basis: str,
+    error_tag: str,
+) -> int:
+    since = (local_date() - timedelta(days=13)).isoformat()
+    recent = conn.execute(
+        f"""SELECT a.id,a.result,a.error_tag
+        FROM attempts a JOIN items i ON i.id=a.item_id
+        WHERE i.level=? AND i.section=? AND i.subtype=?
+          AND a.practice_mode='independent' AND a.judgment_basis=? AND a.made_at>=?
+          AND {FIRST_ATTEMPT_SQL}
+        ORDER BY a.made_at DESC,a.rowid DESC LIMIT 3""",
+        (item["level"], item["section"], item["subtype"], basis, since),
+    ).fetchall()
+    if not recent or recent[0]["id"] != attempt_id:
+        return 0
+    streak = 0
+    for row in recent:
+        if row["result"] not in {"wrong", "partial"} or row["error_tag"] != error_tag:
+            break
+        streak += 1
+    return streak
+
+
+def _resolve_revision_criterion(
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    criterion: str | None,
+    revises: str | None,
+) -> str | None:
+    if criterion is None and revises is None:
+        return None
+    if item["section"] not in {"writing", "translation"}:
+        raise CoachError(
+            "revision_section",
+            "稿件判据和重写关联用于写作或翻译。",
+            "核对题型与记录 ID。",
+        )
+    if criterion is not None:
+        criterion = criterion.strip()
+        if not 0 < len(criterion) <= 240:
+            raise CoachError(
+                "invalid_revision_criterion",
+                "稿件判据须为 1–240 个字符。",
+                "保留一条可检验判据。",
+            )
+    if revises is None:
+        return criterion
+
+    parent = row_dict(
+        conn.execute(
+            "SELECT item_id,judgment_basis,revision_criterion FROM attempts WHERE id=?",
+            (revises,),
+        ).fetchone()
+    )
+    if parent is None or parent["item_id"] != item["id"]:
+        raise CoachError(
+            "revision_parent_mismatch",
+            "找不到同一题下的原稿记录。",
+            "用 revisions 核对原稿 ID。",
+        )
+    if parent["judgment_basis"] != "coach_review":
+        raise CoachError(
+            "revision_parent_unreviewed",
+            "该原稿缺少教练批改。",
+            "选择已有批改和证据的稿件。",
+        )
+    original = parent["revision_criterion"]
+    if original and criterion is not None and criterion != original:
+        raise CoachError(
+            "revision_criterion_mismatch",
+            "重写判据与原稿登记的判据不同。",
+            "省略 --criterion 沿用原稿判据，或保存为单独的练习。",
+        )
+    if not (original or criterion):
+        raise CoachError(
+            "revision_criterion_missing",
+            "旧稿没有结构化判据。",
+            "核对旧稿反馈后用 --criterion 提供本轮判据。",
+        )
+    return original or criterion
+
+
+def _translation_alignment(
+    conn: sqlite3.Connection,
+    item: dict[str, Any],
+    response: str,
+    alignment: Any,
+    revises: str | None,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
+    parent = None
+    if item["section"] == "translation" and revises:
+        row = conn.execute(
+            "SELECT translation_alignment_json FROM attempts WHERE id=?", (revises,)
+        ).fetchone()
+        if row and row[0]:
+            parent = json.loads(row[0])
+    if alignment is None:
+        if parent:
+            raise CoachError(
+                "alignment_required",
+                "该重译需要沿用原有的逐点证据。",
+                "通过 --alignment-file 提交同一组信息点。",
+            )
+        return None, None
+    if item["section"] != "translation":
+        raise CoachError(
+            "alignment_section", "逐点原译对照用于翻译。", "核对题目模块。"
+        )
+    points = validate_alignment(
+        alignment, source=item["prompt"], draft=response, parent_points=parent
+    )
+    return points, alignment_delta(parent, points)
+
+
 def attempt(
     workspace: Path,
     *,
@@ -914,12 +1179,22 @@ def attempt(
     save_response: bool = False,
     rating: str | None = None,
     event_id: str | None = None,
+    practice_mode: str = "independent",
+    criterion: str | None = None,
+    revises: str | None = None,
+    alignment: Any = None,
 ) -> dict[str, Any]:
+    if practice_mode not in {"independent", "assisted"}:
+        raise CoachError(
+            "invalid_practice_mode", "训练模式无效。", "使用 independent 或 assisted。"
+        )
+    if revises is not None:
+        practice_mode = "assisted"
     if not response.strip():
         raise CoachError(
             "empty_response", "必须先有学生实际作答才能提交尝试。", "让学生作答后重试。"
         )
-    if minutes < 0 or minutes > 720:
+    if not 0 <= minutes <= 720:
         raise CoachError(
             "invalid_minutes", "作答分钟数需在 0–720 之间。", "核对 --minutes。"
         )
@@ -940,6 +1215,7 @@ def attempt(
         )
     conn = connect(workspace)
     try:
+        conn.execute("BEGIN IMMEDIATE")
         profile = require_profile(conn)
         item = row_dict(
             conn.execute(
@@ -950,13 +1226,13 @@ def attempt(
             raise CoachError(
                 "item_not_found", "题目不存在或已停用。", "用 material items 核对 ID。"
             )
-        if item["section"] == "listening" and (
-            not item["audio_path"] or not Path(item["audio_path"]).is_file()
-        ):
-            raise CoachError(
-                "audio_missing", "听力题没有可播放音频。", "补音频后再记录听力表现。"
-            )
-        attempt_id = event_id or stable_id("attempt", item_id, now_iso(), response)
+        criterion = _resolve_revision_criterion(conn, item, criterion, revises)
+        points, differences = _translation_alignment(
+            conn, item, response, alignment, revises
+        )
+        alignment_json = json_text(points) if points is not None else None
+        made_at = now_iso()
+        attempt_id = event_id or stable_id("attempt", item_id, made_at, response)
         existing = row_dict(
             conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         )
@@ -967,7 +1243,20 @@ def attempt(
                     "event ID 已用于另一道题。",
                     "为新的作答使用新的 --event-id。",
                 )
+            if (
+                existing["practice_mode"] != practice_mode
+                or existing["revises_attempt_id"] != revises
+                or existing["revision_criterion"] != criterion
+                or existing["translation_alignment_json"] != alignment_json
+            ):
+                raise CoachError(
+                    "idempotency_conflict",
+                    "event ID 已用于另一种作答模式、稿件关联或判据。",
+                    "核对原记录；新作答使用新的 --event-id。",
+                )
             return {"saved": False, "duplicate": True, "attempt": existing}
+        if item["section"] == "listening":
+            _check_bound_audio(conn, item)
         answer = (item["answer"] or "").strip()
         normalized_answer = answer.upper()
         choice_match = re.fullmatch(r"\s*([A-Da-d])\s*[.)]?\s*", response)
@@ -1016,6 +1305,22 @@ def attempt(
                 "写作和翻译批改需有具体反馈和作品证据。",
                 "补充 --feedback 与 --evidence（学生原句或位置）。",
             )
+        if (
+            points is not None
+            and result == "correct"
+            and any(point["status"] != "preserved" for point in points)
+        ):
+            raise CoachError(
+                "alignment_result_mismatch",
+                "逐点核对仍有失真、遗漏或待核信息。",
+                "按当前稿件的证据调整结果。",
+            )
+        if criterion is not None and judgment_basis != "coach_review":
+            raise CoachError(
+                "revision_feedback_missing",
+                "稿件判据需配合实际批改结果与证据。",
+                "补充 --result、--feedback 和 --evidence。",
+            )
         previous = row_dict(
             conn.execute(
                 "SELECT * FROM review_cards WHERE item_id=?", (item_id,)
@@ -1023,18 +1328,21 @@ def attempt(
         )
         scheduled = next_review(
             section=item["section"],
-            result=result,
+            result=result if practice_mode == "independent" else "unverified",
             previous=previous,
             exam_date=profile["exam_date"],
             rating=rating,
         )
         with conn:
             conn.execute(
-                "INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                """INSERT INTO attempts(
+                       id,item_id,made_at,response,result,minutes,error_tag,judgment_basis,feedback,evidence,practice_mode,
+                       revision_criterion,revises_attempt_id,translation_alignment_json
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     attempt_id,
                     item_id,
-                    now_iso(),
+                    made_at,
                     response if save_response else None,
                     result,
                     minutes,
@@ -1042,8 +1350,22 @@ def attempt(
                     judgment_basis,
                     feedback,
                     evidence,
+                    practice_mode,
+                    criterion,
+                    revises,
+                    alignment_json,
                 ),
             )
+            if practice_mode == "independent" and judgment_basis in {
+                "verified_key",
+                "coach_review",
+            }:
+                conn.execute(
+                    """DELETE FROM plans WHERE week_start=? AND (
+                        focus IS NULL OR (focus=? AND json_extract(payload_json, '$.focus_detail.subtype') IS NULL)
+                    )""",
+                    (_week_start(date.fromisoformat(made_at[:10])), item["section"]),
+                )
             if scheduled:
                 conn.execute(
                     """INSERT INTO review_cards(item_id,due_at,stage,scheduler,card_json,updated_at)
@@ -1062,7 +1384,8 @@ def attempt(
         recent = [
             row[0]
             for row in conn.execute(
-                "SELECT result FROM attempts WHERE item_id=? ORDER BY made_at DESC,id DESC LIMIT 3",
+                """SELECT result FROM attempts WHERE item_id=? AND practice_mode='independent'
+                   ORDER BY made_at DESC,rowid DESC LIMIT 3""",
                 (item_id,),
             )
         ]
@@ -1072,19 +1395,41 @@ def attempt(
                 failures += 1
             else:
                 break
+        same_error_streak = 0
+        if (
+            practice_mode == "independent"
+            and result in {"wrong", "partial"}
+            and error_tag
+        ):
+            same_error_streak = _same_error_streak(
+                conn, item, attempt_id, judgment_basis, error_tag
+            )
+        highest_streak = max(failures, same_error_streak)
         next_action = (
-            "停止加题；最小重建后换题复测。"
-            if failures >= 3
+            "暂停加题；看一个反例，学生能复述判据后再换新题。"
+            if highest_streak >= 3
             else "缩小训练步长，指出第一个卡点后复测。"
-            if failures >= 2
+            if highest_streak >= 2
             else "按错因订正或继续下一题。"
         )
+        if differences and differences["regressed"]:
+            next_action = "先核对新增失真或遗漏的信息点：" + "、".join(
+                differences["regressed"]
+            )
         return {
             "saved": True,
             "attempt_id": attempt_id,
             "item_id": item_id,
             "result": result,
             "judgment_basis": judgment_basis,
+            "practice_mode": practice_mode,
+            "revision_criterion": criterion,
+            "revises_attempt_id": revises,
+            "translation_alignment": points,
+            "alignment_delta": differences,
+            "transcript_reveal": item["transcript"]
+            if item["section"] == "listening"
+            else None,
             "answer_reveal": answer
             if item["answer_status"] in {"verified", "generated"}
             else None,
@@ -1098,8 +1443,66 @@ def attempt(
             else None,
             "review": scheduled,
             "consecutive_failures": failures,
+            "same_error_streak_distinct_items": same_error_streak,
             "next_action": next_action,
             "response_saved": save_response,
+        }
+    finally:
+        conn.close()
+
+
+def revision_history(workspace: Path, *, item_id: str) -> dict[str, Any]:
+    """Read scoped writing feedback and explicit revision links without draft text."""
+    conn = connect(workspace)
+    try:
+        profile = require_profile(conn)
+        item = conn.execute(
+            "SELECT section,subtype FROM items WHERE id=? AND level=?",
+            (item_id, profile["level"]),
+        ).fetchone()
+        if not item or item["section"] not in {"writing", "translation"}:
+            raise CoachError(
+                "revision_item_missing", "找不到当前级别的写译题。", "核对题目 ID。"
+            )
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT id,made_at,result,minutes,judgment_basis,practice_mode,
+                          revision_criterion,revises_attempt_id,feedback,evidence,translation_alignment_json,
+                          response IS NOT NULL AS response_saved
+                     FROM attempts WHERE item_id=? ORDER BY made_at,rowid""",
+                (item_id,),
+            )
+        ]
+        for row in rows:
+            stored = row.pop("translation_alignment_json")
+            row["translation_alignment"] = json.loads(stored) if stored else None
+        by_id = {row["id"]: row for row in rows}
+        for row in rows:
+            parent = by_id.get(row["revises_attempt_id"])
+            parent_criterion = parent["revision_criterion"] if parent else None
+            row["matches_parent_criterion"] = (
+                row["revision_criterion"] == parent_criterion
+                if parent_criterion
+                else None
+            )
+            row["alignment_delta"] = alignment_delta(
+                parent["translation_alignment"] if parent else None,
+                row["translation_alignment"],
+            )
+            row["response_saved"] = bool(row["response_saved"])
+        return {
+            "item_id": item_id,
+            "section": item["section"],
+            "subtype": item["subtype"],
+            "independent_drafts": sum(
+                row["practice_mode"] == "independent" for row in rows
+            ),
+            "guided_rewrites": sum(
+                row["revises_attempt_id"] is not None for row in rows
+            ),
+            "attempts": rows,
+            "basis": "同题重写用于批改回访；独立迁移需另做新题。",
         }
     finally:
         conn.close()
@@ -1120,7 +1523,16 @@ def add_checkpoint(
     score_reading: int | None = None,
     score_writing_translation: int | None = None,
     event_id: str | None = None,
+    comparison_key: str | None = None,
 ) -> dict[str, Any]:
+    if comparison_key is not None:
+        comparison_key = comparison_key.strip()
+        if not 0 < len(comparison_key) <= 120:
+            raise CoachError(
+                "invalid_comparison_key",
+                "模考口径名需包含 1–120 个字符。",
+                "核对 --comparison-key。",
+            )
     taken_on = parse_date(taken_on, "taken_on") or today_iso()
     if date.fromisoformat(taken_on) > local_date():
         raise CoachError(
@@ -1168,7 +1580,7 @@ def add_checkpoint(
                 )
             if any(
                 value is not None
-                for value in (section, correct, question_total, minutes)
+                for value in (section, correct, question_total, minutes, comparison_key)
             ):
                 raise CoachError(
                     "official_raw_mix",
@@ -1225,17 +1637,29 @@ def add_checkpoint(
             str(correct),
             str(question_total),
         )
+        conn.execute("BEGIN IMMEDIATE")
         existing = row_dict(
             conn.execute(
                 "SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,)
             ).fetchone()
         )
         if existing:
-            if (
-                existing["kind"] != kind
-                or existing["taken_on"] != taken_on
-                or existing["source"] != source.strip()
-            ):
+            expected = {
+                "kind": kind,
+                "taken_on": taken_on,
+                "source": source.strip(),
+                "level": profile["level"],
+                "section": section,
+                "correct": correct,
+                "question_total": question_total,
+                "minutes": minutes,
+                "score_total": score_total,
+                "score_listening": score_listening,
+                "score_reading": score_reading,
+                "score_writing_translation": score_writing_translation,
+                "comparison_key": comparison_key,
+            }
+            if any(existing[key] != value for key, value in expected.items()):
                 raise CoachError(
                     "idempotency_conflict",
                     "event ID 已用于另一条检查点。",
@@ -1244,7 +1668,10 @@ def add_checkpoint(
             return {"saved": False, "duplicate": True, "checkpoint": existing}
         with conn:
             conn.execute(
-                "INSERT INTO checkpoints VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT INTO checkpoints(
+                       id,kind,level,taken_on,section,correct,question_total,minutes,score_total,
+                       score_listening,score_reading,score_writing_translation,source,created_at,comparison_key
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     checkpoint_id,
                     kind,
@@ -1260,6 +1687,7 @@ def add_checkpoint(
                     score_writing_translation,
                     source.strip(),
                     now_iso(),
+                    comparison_key,
                 ),
             )
             conn.execute("DELETE FROM plans")
@@ -1284,41 +1712,132 @@ def _latest_checkpoint_marker(conn: sqlite3.Connection) -> str | None:
     return row[0] if row else None
 
 
+SUBTYPE_CHECKS = {
+    "short_news": "写出报道的核心事件，并指出支持判断的听到的信息。",
+    "long_conversation": "写出说话者的意图或关键变化，并指出一处音频依据。",
+    "listening_passage": "先抓关键信息，再用一处音频依据排除干扰项。",
+    "lecture": "写出观点或转折后的结论，并指出一句音频依据。",
+    "banked_cloze": "标出词性、搭配或上下文线索，再选择对应词。",
+    "matching": "圈出段落中的同义定位词，并说明匹配原因。",
+    "careful_reading": "先说题干问什么，指向支撑答案的原文，并说出最像的干扰项为何错。",
+    "essay": "围绕同一条判据二改，标出原句和修改后消除了什么问题。",
+    "paragraph": "对照原文信息点核对二稿，指出补回或修正的一处关系。",
+}
+
+
+def _subtype_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[(row["section"], row["subtype"])].append(row)
+    result = []
+    for (section, subtype), events in sorted(groups.items()):
+        outcomes = Counter(event["result"] for event in events)
+        tags = Counter(
+            event["error_tag"]
+            for event in events
+            if event["result"] in {"wrong", "partial"} and event["error_tag"]
+        )
+        repeats = {tag: count for tag, count in tags.items() if count >= 2}
+        top_tag = min(repeats, key=lambda tag: (-repeats[tag], tag), default=None)
+        result.append(
+            {
+                "section": section,
+                "subtype": subtype,
+                "sample_count": len(events),
+                "correct": outcomes["correct"],
+                "wrong": outcomes["wrong"],
+                "partial": outcomes["partial"],
+                "error_rate": round(
+                    (outcomes["wrong"] + outcomes["partial"] * 0.5) / len(events), 4
+                ),
+                "repeated_errors": repeats,
+                "top_error_tag": top_tag,
+                "verification": SUBTYPE_CHECKS[subtype],
+            }
+        )
+    return result
+
+
+def _select_focus_detail(
+    section: str | None, evidence: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    candidates = [
+        item
+        for item in evidence
+        if item["section"] == section and item["error_rate"] > 0
+    ]
+    minimum = 3 if section in {"reading", "listening"} else 1
+    supported = [item for item in candidates if item["sample_count"] >= minimum]
+    provisional = [item for item in candidates if item["top_error_tag"]]
+    selected = min(
+        supported or provisional,
+        key=lambda item: (
+            -item["error_rate"],
+            -max(item["repeated_errors"].values(), default=0),
+            -item["sample_count"],
+            item["subtype"],
+        ),
+        default=None,
+    )
+    if selected is None:
+        return None
+    return {
+        **selected,
+        "basis": "independent-first-attempts"
+        if supported
+        else "provisional-repeated-error",
+    }
+
+
 def _focus_from_evidence(
     conn: sqlite3.Connection, profile: dict[str, Any], current: date
-) -> tuple[str | None, str, dict[str, Any]]:
-    since = (current - timedelta(days=14)).isoformat()
+) -> tuple[str | None, str, dict[str, Any], dict[str, Any] | None]:
+    since = (current - timedelta(days=13)).isoformat()
+    next_day = (current + timedelta(days=1)).isoformat()
     rows = [
         dict(row)
         for row in conn.execute(
-            """SELECT * FROM (
-                 SELECT i.section,a.result,a.error_tag,a.made_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY a.item_id ORDER BY a.made_at,a.id
-                        ) AS attempt_number
-                 FROM attempts a JOIN items i ON i.id=a.item_id
-                 WHERE i.level=?
-               ) WHERE made_at>=?""",
-            (profile["level"], since),
+            f"""SELECT i.section,i.subtype,a.result,a.error_tag,a.practice_mode,a.judgment_basis,
+                       {FIRST_ATTEMPT_SQL} AS first_attempt
+                FROM attempts a JOIN items i ON i.id=a.item_id
+                WHERE i.level=? AND a.made_at>=? AND a.made_at<?""",
+            (profile["level"], since, next_day),
         )
     ]
     by_section: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if (
             row["section"] in {"listening", "reading", "writing", "translation"}
-            and row["result"] != "unverified"
-            and row["attempt_number"] == 1
+            and row["practice_mode"] == "independent"
+            and row["judgment_basis"]
+            in (
+                {"verified_key"}
+                if row["section"] in {"listening", "reading"}
+                else {"coach_review"}
+            )
+            and row["first_attempt"]
         ):
             by_section[row["section"]].append(row)
+    subtype_evidence = _subtype_evidence(
+        [event for events in by_section.values() for event in events]
+    )
     candidates = []
     weights = {"listening": 0.35, "reading": 0.35, "writing": 0.15, "translation": 0.15}
     samples: dict[str, Any] = {}
     for section, events in by_section.items():
-        all_section_rows = [row for row in rows if row["section"] == section]
+        all_section_rows = [
+            row
+            for row in rows
+            if row["section"] == section and row["practice_mode"] == "independent"
+        ]
         minimum = 3 if section in {"listening", "reading"} else 1
         wrong = sum(event["result"] == "wrong" for event in events)
         partial = sum(event["result"] == "partial" for event in events)
-        tags = Counter(row["error_tag"] for row in all_section_rows if row["error_tag"])
+        tags = Counter(
+            row["error_tag"]
+            for row in events
+            if row["error_tag"] and row["result"] in {"wrong", "partial"}
+        )
         samples[section] = {
             "attempts": len(all_section_rows),
             "new_items": len(events),
@@ -1330,17 +1849,40 @@ def _focus_from_evidence(
             error_rate = (wrong + partial * 0.5) / len(events)
             repeated = sum(value - 1 for value in tags.values() if value >= 2)
             candidates.append((weights[section] * error_rate, repeated, section))
+    mock_rows = conn.execute(
+        """SELECT section,correct,question_total,source FROM checkpoints
+           WHERE kind='mock' AND level=? AND taken_on BETWEEN ? AND ?
+                 AND comparison_key IS NOT NULL AND question_total>=5
+           ORDER BY taken_on DESC, created_at DESC, id DESC""",
+        (profile["level"], since, current.isoformat()),
+    )
+    observed_sections = {section for _, _, section in candidates}
+    for row in mock_rows:
+        section = row["section"]
+        if section not in weights or section in observed_sections:
+            continue
+        observed_sections.add(section)
+        error_rate = 1 - row["correct"] / row["question_total"]
+        samples.setdefault(section, {})["timed_mock"] = dict(row)
+        candidates.append((weights[section] * error_rate, 0, section))
     if candidates:
         candidates.sort(reverse=True)
         chosen = candidates[0][2]
         return (
             chosen,
-            f"近 14 天 {chosen} 的独立作答与重复错因；只作训练优先级，不预测报道分。",
+            f"近 14 天 {chosen} 的独立作答或限时模考证据，暂定为训练主攻。",
             samples,
+            _select_focus_detail(chosen, subtype_evidence),
         )
     if profile["weak_section"] in {"listening", "reading", "writing", "translation"}:
-        return profile["weak_section"], "用户自述弱项，尚需限时检查点校准。", samples
-    return None, "缺少足够的同型独立作答证据，先做短时诊断。", samples
+        section = profile["weak_section"]
+        return (
+            section,
+            "用户自述弱项，尚需限时检查点校准。",
+            samples,
+            _select_focus_detail(section, subtype_evidence),
+        )
+    return None, "缺少足够的同型独立作答证据，先做短时诊断。", samples, None
 
 
 def plan(
@@ -1349,96 +1891,104 @@ def plan(
     day = current or local_date()
     conn = connect(workspace)
     try:
-        profile = require_profile(conn)
-        week = _week_start(day)
-        marker = _latest_checkpoint_marker(conn)
-        old = row_dict(
-            conn.execute("SELECT * FROM plans WHERE week_start=?", (week,)).fetchone()
-        )
-        if (
-            old
-            and not force
-            and old["profile_updated_at"] == profile["updated_at"]
-            and old["latest_checkpoint"] == marker
-        ):
-            return {**json.loads(old["payload_json"]), "reused": True}
-        exam_date = (
-            date.fromisoformat(profile["exam_date"]) if profile["exam_date"] else None
-        )
-        days_remaining = (exam_date - day).days if exam_date else None
-        if days_remaining is not None and days_remaining < 0:
-            focus, basis, samples = (
-                None,
-                "已过档案中的考试日期；请设置新考试日期后重排。",
-                {},
-            )
-            phase = "past_exam"
-        elif days_remaining == 0:
-            focus, basis, samples = (
-                None,
-                "今天是档案中的考试日；以准考证与考点安排为准，停止常规加题。",
-                {},
-            )
-            phase = "exam_day"
-        else:
-            focus, basis, samples = _focus_from_evidence(conn, profile, day)
-            phase = (
-                "final_14_days"
-                if days_remaining is not None and days_remaining <= 14
-                else "sprint"
-                if days_remaining is not None and days_remaining <= 60
-                else "build_or_unknown"
-            )
-        payload = {
-            "week_start": week,
-            "level": profile["level"],
-            "exam_date": profile["exam_date"],
-            "days_remaining": days_remaining,
-            "phase": phase,
-            "focus": focus,
-            "focus_label": focus or "短时诊断",
-            "basis": basis,
-            "sample_evidence": samples,
-            "buffer_ratio": 0.15,
-            "max_daily_tasks": 3,
-            "checkpoint_trigger": "新的同型限时模考、官方成绩、考试日期或现实容量变化后重排。",
-        }
-        with conn:
-            conn.execute(
-                """INSERT INTO plans VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(week_start) DO UPDATE SET generated_at=excluded.generated_at,
-                   focus=excluded.focus,basis=excluded.basis,profile_updated_at=excluded.profile_updated_at,
-                   latest_checkpoint=excluded.latest_checkpoint,payload_json=excluded.payload_json""",
-                (
-                    week,
-                    now_iso(),
-                    focus,
-                    basis,
-                    profile["updated_at"],
-                    marker,
-                    json_text(payload),
-                ),
-            )
-        return {**payload, "reused": False}
+        return _plan_for_day(conn, require_profile(conn), day, force=force)
     finally:
         conn.close()
 
 
+def _plan_for_day(
+    conn: sqlite3.Connection, profile: dict[str, Any], day: date, *, force: bool = False
+) -> dict[str, Any]:
+    week = _week_start(day)
+    marker = _latest_checkpoint_marker(conn)
+    exam_date = (
+        date.fromisoformat(profile["exam_date"]) if profile["exam_date"] else None
+    )
+    days_remaining = (exam_date - day).days if exam_date else None
+    if days_remaining is None or days_remaining > 60:
+        phase = "build_or_unknown"
+    elif days_remaining < 0:
+        phase = "past_exam"
+    elif days_remaining == 0:
+        phase = "exam_day"
+    elif days_remaining <= 14:
+        phase = "final_14_days"
+    else:
+        phase = "sprint"
+    old = row_dict(
+        conn.execute("SELECT * FROM plans WHERE week_start=?", (week,)).fetchone()
+    )
+    if (
+        old
+        and not force
+        and old["profile_updated_at"] == profile["updated_at"]
+        and old["latest_checkpoint"] == marker
+    ):
+        cached = json.loads(old["payload_json"])
+        if cached["phase"] == phase and "focus_detail" in cached:
+            return {**cached, "days_remaining": days_remaining, "reused": True}
+    focus_detail = None
+    if phase == "past_exam":
+        focus, basis, samples = (
+            None,
+            "已过档案中的考试日期；请设置新考试日期后重排。",
+            {},
+        )
+    elif phase == "exam_day":
+        focus, basis, samples = (
+            None,
+            "今天是档案中的考试日；以准考证与考点安排为准，停止常规加题。",
+            {},
+        )
+    else:
+        focus, basis, samples, focus_detail = _focus_from_evidence(conn, profile, day)
+    payload = {
+        "week_start": week,
+        "level": profile["level"],
+        "exam_date": profile["exam_date"],
+        "days_remaining": days_remaining,
+        "phase": phase,
+        "focus": focus,
+        "focus_label": focus or "短时诊断",
+        "focus_detail": focus_detail,
+        "basis": basis,
+        "sample_evidence": samples,
+        "buffer_ratio": 0.15,
+        "max_daily_tasks": 3,
+        "checkpoint_trigger": "新的同型限时模考、官方成绩、考试日期或现实容量变化后重排。",
+    }
+    with conn:
+        conn.execute(
+            """INSERT INTO plans VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(week_start) DO UPDATE SET generated_at=excluded.generated_at,
+               focus=excluded.focus,basis=excluded.basis,profile_updated_at=excluded.profile_updated_at,
+               latest_checkpoint=excluded.latest_checkpoint,payload_json=excluded.payload_json""",
+            (
+                week,
+                now_iso(),
+                focus,
+                basis,
+                profile["updated_at"],
+                marker,
+                json_text(payload),
+            ),
+        )
+    return {**payload, "reused": False}
+
+
 def today(workspace: Path, *, current: date | None = None) -> dict[str, Any]:
     day = current or local_date()
-    week_plan = plan(workspace, current=day)
     conn = connect(workspace)
     try:
         profile = require_profile(conn)
+        week_plan = _plan_for_day(conn, profile, day)
+        focus_detail = week_plan["focus_detail"]
         available = (
             profile["weekend_minutes"]
             if day.weekday() >= 5
             else profile["weekday_minutes"]
         )
         budget = int(available * 0.85)
-        due = conn.execute(
-            "SELECT COUNT(*) FROM review_cards WHERE due_at<=?", (day.isoformat(),)
-        ).fetchone()[0]
         if week_plan["phase"] in {"past_exam", "exam_day"} or budget == 0:
             with conn:
                 conn.execute(
@@ -1459,6 +2009,9 @@ def today(workspace: Path, *, current: date | None = None) -> dict[str, Any]:
                 "tasks": [],
                 "reason": reason,
             }
+        due = conn.execute(
+            "SELECT COUNT(*) FROM review_cards WHERE due_at<=?", (day.isoformat(),)
+        ).fetchone()[0]
         specs: list[tuple[str, str | None, str, int, str]] = []
         if week_plan["focus"] is None:
             count = min(budget, 25)
@@ -1490,15 +2043,14 @@ def today(workspace: Path, *, current: date | None = None) -> dict[str, Any]:
                 min(15, max(0, int(remaining * 0.20))) if remaining >= 45 else 0
             )
             main_minutes = remaining - maintain_minutes
-            specs.append(
-                (
-                    "main",
-                    focus,
-                    f"主攻 {focus}：完成一次无提示或限时训练",
-                    main_minutes,
-                    "独立作答、标来源和用时、写出首个决定性错因",
-                )
-            )
+            title = f"主攻 {focus}：完成一次无提示或限时训练"
+            verification = "独立作答、标来源和用时、写出首个决定性错因"
+            if focus_detail:
+                title = f"主攻 {focus} / {focus_detail['subtype']}"
+                if focus_detail["top_error_tag"]:
+                    title += f"：先修「{focus_detail['top_error_tag']}」"
+                verification = focus_detail["verification"]
+            specs.append(("main", focus, title, main_minutes, verification))
             if maintain_minutes:
                 specs.append(
                     (
@@ -1509,52 +2061,62 @@ def today(workspace: Path, *, current: date | None = None) -> dict[str, Any]:
                         "留下可核验作答，不以看懂代替完成",
                     )
                 )
-        expected_ids = {
-            stable_id("task", day.isoformat(), role, section or "all")
-            for role, section, *_ in specs[:3]
-        }
+
+        def daily_task_id(role: str, section: str | None) -> str:
+            parts = ("task", day.isoformat(), role, section or "all")
+            if role == "main" and focus_detail:
+                return stable_id(*parts, focus_detail["subtype"])
+            return stable_id(*parts)
+
+        specs = specs[:3]
+        task_ids = [daily_task_id(role, section) for role, section, *_ in specs]
+        placeholders = ",".join("?" for _ in task_ids)
+        stamp = now_iso()
         with conn:
-            for pending in conn.execute(
-                "SELECT id FROM task_logs WHERE task_date=? AND completed=0",
-                (day.isoformat(),),
-            ).fetchall():
-                if pending["id"] not in expected_ids:
-                    conn.execute("DELETE FROM task_logs WHERE id=?", (pending["id"],))
-        tasks = []
-        for order, (role, section, title, minutes, verification) in enumerate(
-            specs[:3], 1
-        ):
-            task_id = stable_id("task", day.isoformat(), role, section or "all")
-            with conn:
-                conn.execute(
-                    """INSERT OR IGNORE INTO task_logs(id,task_date,role,section,title,planned_minutes,updated_at)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (
-                        task_id,
-                        day.isoformat(),
-                        role,
-                        section,
-                        title,
-                        minutes,
-                        now_iso(),
-                    ),
-                )
-            row = row_dict(
-                conn.execute(
-                    "SELECT completed,actual_minutes,evidence FROM task_logs WHERE id=?",
-                    (task_id,),
-                ).fetchone()
+            conn.execute(
+                f"""DELETE FROM task_logs
+                    WHERE task_date=? AND completed=0 AND id NOT IN ({placeholders})""",
+                (day.isoformat(), *task_ids),
             )
+            conn.executemany(
+                """INSERT OR IGNORE INTO task_logs(id,task_date,role,section,title,planned_minutes,updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (
+                    (task_id, day.isoformat(), role, section, title, minutes, stamp)
+                    for task_id, (role, section, title, minutes, _) in zip(
+                        task_ids, specs
+                    )
+                ),
+            )
+            progress = {
+                row["id"]: row
+                for row in conn.execute(
+                    f"""SELECT id,completed,actual_minutes,evidence FROM task_logs
+                        WHERE id IN ({placeholders})""",
+                    task_ids,
+                )
+            }
+        tasks = []
+        for order, (
+            task_id,
+            (role, section, title, minutes, verification),
+        ) in enumerate(zip(task_ids, specs), 1):
+            row = progress[task_id]
             tasks.append(
                 {
                     "id": task_id,
                     "order": order,
                     "role": role,
                     "section": section,
+                    "subtype": focus_detail["subtype"]
+                    if role == "main" and focus_detail
+                    else None,
                     "title": title,
                     "planned_minutes": minutes,
                     "verification": verification,
-                    **row,
+                    "completed": row["completed"],
+                    "actual_minutes": row["actual_minutes"],
+                    "evidence": row["evidence"],
                 }
             )
         return {
@@ -1563,6 +2125,7 @@ def today(workspace: Path, *, current: date | None = None) -> dict[str, Any]:
             "training_budget_minutes": budget,
             "buffer_minutes": available - budget,
             "focus": week_plan["focus"],
+            "focus_detail": focus_detail,
             "basis": week_plan["basis"],
             "due_review_count": due,
             "tasks": tasks,
@@ -1610,35 +2173,47 @@ def log_task(
         conn.close()
 
 
-def review(workspace: Path, *, limit: int = 20) -> dict[str, Any]:
+def review(
+    workspace: Path, *, limit: int = 20, through: str | None = None
+) -> dict[str, Any]:
     if not 1 <= limit <= 100:
         raise CoachError(
             "invalid_limit", "复习列表上限需在 1–100 之间。", "调整 --limit。"
         )
+    target_day = parse_date(through, "date") or today_iso()
     conn = connect(workspace)
     try:
         require_profile(conn)
         rows = [
             dict(row)
             for row in conn.execute(
-                """SELECT r.item_id,r.due_at,r.scheduler,i.section,i.subtype,i.source_type,i.audio_path
+                """SELECT r.item_id,r.due_at,r.scheduler,i.section,i.subtype,i.source_type,
+                          i.audio_path,i.audio_sha256,i.material_id,i.locator
                FROM review_cards r JOIN items i ON i.id=r.item_id
                WHERE r.due_at<=? AND i.active=1 ORDER BY r.due_at,r.item_id LIMIT ?""",
-                (today_iso(), limit),
+                (target_day, limit),
             )
         ]
+        fingerprints: dict[str, str] = {}
         for row in rows:
-            row["audio_ready"] = (
-                bool(row["audio_path"] and Path(row["audio_path"]).is_file())
-                if row["section"] == "listening"
-                else None
-            )
-            row.pop("audio_path")
+            row["audio_ready"] = None
+            row["audio_error"] = None
+            if row["section"] == "listening":
+                try:
+                    _check_bound_audio(conn, row, fingerprints)
+                except CoachError as exc:
+                    row["audio_ready"] = False
+                    row["audio_error"] = exc.code
+                else:
+                    row["audio_ready"] = True
+            for column in ("audio_path", "audio_sha256", "material_id"):
+                row.pop(column)
         total = conn.execute(
             "SELECT COUNT(*) FROM review_cards r JOIN items i ON i.id=r.item_id WHERE r.due_at<=? AND i.active=1",
-            (today_iso(),),
+            (target_day,),
         ).fetchone()[0]
         return {
+            "through": target_day,
             "total_due": total,
             "items": rows,
             "instruction": "用 drill --item-id ID 精确取到期题；先独立回忆，这里不显示答案。",
@@ -1664,14 +2239,18 @@ def report(workspace: Path, *, days: int = 7) -> dict[str, Any]:
         attempt_rows = [
             dict(row)
             for row in conn.execute(
-                """SELECT i.section,i.subtype,a.result,a.error_tag,a.minutes,a.judgment_basis
-               FROM attempts a JOIN items i ON i.id=a.item_id WHERE a.made_at>=?""",
-                (since,),
+                """SELECT i.section,i.subtype,a.result,a.error_tag,a.minutes,a.judgment_basis,a.practice_mode,a.revises_attempt_id
+               FROM attempts a JOIN items i ON i.id=a.item_id WHERE a.made_at>=? AND i.level=?""",
+                (since, profile["level"]),
             )
         ]
         sections: dict[str, dict[str, Any]] = {}
         for section in SECTIONS:
-            events = [row for row in attempt_rows if row["section"] == section]
+            events = [
+                row
+                for row in attempt_rows
+                if row["section"] == section and row["practice_mode"] == "independent"
+            ]
             if events:
                 sections[section] = {
                     "attempts": len(events),
@@ -1682,13 +2261,15 @@ def report(workspace: Path, *, days: int = 7) -> dict[str, Any]:
                     "minutes": round(sum(row["minutes"] for row in events), 1),
                 }
         error_counts = Counter(
-            row["error_tag"] for row in attempt_rows if row["error_tag"]
+            row["error_tag"]
+            for row in attempt_rows
+            if row["error_tag"] and row["practice_mode"] == "independent"
         )
         checkpoints = [
             dict(row)
             for row in conn.execute(
-                "SELECT kind,taken_on,section,correct,question_total,minutes,score_total,score_listening,score_reading,score_writing_translation,source FROM checkpoints WHERE taken_on>=? ORDER BY taken_on",
-                (since,),
+                "SELECT kind,taken_on,section,correct,question_total,minutes,score_total,score_listening,score_reading,score_writing_translation,source,comparison_key FROM checkpoints WHERE taken_on>=? AND level=? ORDER BY taken_on,created_at,id",
+                (since, profile["level"]),
             )
         ]
         return {
@@ -1703,6 +2284,12 @@ def report(workspace: Path, *, days: int = 7) -> dict[str, Any]:
                 ),
             },
             "independent_attempts": sections,
+            "assisted_attempts": sum(
+                row["practice_mode"] == "assisted" for row in attempt_rows
+            ),
+            "guided_rewrites": sum(
+                row["revises_attempt_id"] is not None for row in attempt_rows
+            ),
             "repeated_error_tags": {
                 tag: count for tag, count in error_counts.items() if count >= 2
             },
@@ -1722,20 +2309,16 @@ def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
     summary = report(workspace, days=days)
     conn = connect(workspace)
     try:
-        require_profile(conn)
+        profile = require_profile(conn)
         since = summary["since"]
         attempts = [
             dict(row)
             for row in conn.execute(
-                """SELECT * FROM (
-                     SELECT i.section,i.source_type,a.item_id,a.made_at,a.result,
-                            a.judgment_basis,a.error_tag,a.feedback,a.evidence,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY a.item_id ORDER BY a.made_at,a.id
-                            ) AS attempt_number
-                     FROM attempts a JOIN items i ON i.id=a.item_id
-                   ) WHERE made_at>=?""",
-                (since,),
+                f"""SELECT i.section,i.subtype,i.source_type,a.result,a.judgment_basis,
+                           a.error_tag,a.feedback,a.evidence,{FIRST_ATTEMPT_SQL} AS first_attempt
+                    FROM attempts a JOIN items i ON i.id=a.item_id
+                    WHERE i.level=? AND a.made_at>=? AND a.practice_mode='independent'""",
+                (profile["level"], since),
             )
         ]
         task_evidence = conn.execute(
@@ -1757,8 +2340,8 @@ def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
         if row["section"] in {"listening", "reading"}
         and row["judgment_basis"] == "generated_key"
     ]
-    fresh_verified = [row for row in verified if row["attempt_number"] == 1]
-    fresh_generated = [row for row in generated if row["attempt_number"] == 1]
+    fresh_verified = [row for row in verified if row["first_attempt"]]
+    fresh_generated = [row for row in generated if row["first_attempt"]]
     subjective = [
         row
         for row in attempts
@@ -1793,33 +2376,50 @@ def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
     execution_rate = round(completed / planned, 3) if planned else None
 
     comparable: list[dict[str, Any]] = []
-    by_format: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    by_format: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
     for checkpoint in mocks:
-        if checkpoint["question_total"] and checkpoint["section"]:
-            by_format[(checkpoint["section"], checkpoint["question_total"])].append(
-                checkpoint
-            )
-    for (section, total), records in by_format.items():
-        if len(records) < 2:
-            continue
-        older, newer = records[-2:]
-        older_minutes, newer_minutes = older["minutes"], newer["minutes"]
         if (
-            not older_minutes
-            or not newer_minutes
-            or abs(newer_minutes - older_minutes) / max(older_minutes, newer_minutes)
-            > 0.2
+            checkpoint["question_total"]
+            and checkpoint["section"]
+            and checkpoint["comparison_key"]
         ):
+            by_format[
+                (
+                    checkpoint["section"],
+                    checkpoint["question_total"],
+                    checkpoint["comparison_key"],
+                )
+            ].append(checkpoint)
+    for (section, total, key), records in by_format.items():
+        newer = records[-1]
+        older = next(
+            (
+                row
+                for row in reversed(records[:-1])
+                if row["taken_on"] < newer["taken_on"]
+                and row["source"].casefold() != newer["source"].casefold()
+                and row["minutes"]
+                and newer["minutes"]
+                and abs(newer["minutes"] - row["minutes"])
+                / max(row["minutes"], newer["minutes"])
+                <= 0.2
+            ),
+            None,
+        )
+        if older is None:
             continue
         comparable.append(
             {
                 "section": section,
+                "comparison_key": key,
                 "question_total": total,
                 "earlier_date": older["taken_on"],
                 "later_date": newer["taken_on"],
+                "earlier_source": older["source"],
+                "later_source": newer["source"],
                 "earlier_raw_accuracy": round(older["correct"] / total, 3),
                 "later_raw_accuracy": round(newer["correct"] / total, 3),
-                "limit": "只核对了题型、题数和时长；试卷难度可能不同，不能据此预测报道分。",
+                "limit": "卷组和时长相近只提供原始正确率对照，试卷难度仍可能有差异。",
             }
         )
 
@@ -1873,7 +2473,9 @@ def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
             "new_verified_questions": len(fresh_verified),
             "original_generated_key_attempts": len(generated),
             "new_original_questions": len(fresh_generated),
-            "review_attempts": sum(row["attempt_number"] > 1 for row in attempts),
+            "review_attempts": sum(not row["first_attempt"] for row in attempts),
+            "assisted_attempts": summary["assisted_attempts"],
+            "guided_writing_translation_rewrites": summary["guided_rewrites"],
             "supported_writing_translation_reviews": len(subjective),
             "timed_mock_checkpoints": len(mocks),
             "official_score_reports": len(official),
@@ -1883,6 +2485,8 @@ def efficiency(workspace: Path, *, days: int = 7) -> dict[str, Any]:
         "independent_answer_quality": {
             "verified_source_questions": verified_quality,
             "original_practice_questions": generated_quality,
+            "verified_subtype_evidence": _subtype_evidence(fresh_verified),
+            "original_subtype_evidence": _subtype_evidence(fresh_generated),
         },
         "repeated_error_tags": repeated,
         "comparable_mock_pairs": comparable,

@@ -45,6 +45,36 @@
       "name": "current official date",
       "user": "我考 2026 年下半年的英语四级，考试是哪天？",
       "expect": ["checks the current NEEA notice", "cites the 2026-09-02 announcement for the 2026-12-12 written exam", "distinguishes school-specific registration arrangements from the national exam date"]
+    },
+    {
+      "name": "assisted listening evidence",
+      "user": "我看了六级讲座脚本再听，选对了，能算进本周听力正确率吗？",
+      "expect": ["labels assisted practice", "does not replace independent evidence", "offers a new audio item under explicit listening conditions"]
+    },
+    {
+      "name": "matched mocks exclude repeat papers",
+      "user": "昨天仔细阅读 5/10，今天重做同一卷 8/10，听力也 8/10，报告我进步了多少？",
+      "expect": ["keeps raw results visible", "does not compare repeat paper or mixed modules as improvement", "asks for one comparable new paper"]
+    },
+    {
+      "name": "exam-day cached plan",
+      "user": "昨天练过阅读，今天是档案里的四级考试日，还要做一套吗？",
+      "expect": ["uses today's date over cached phase", "keeps the previously completed record", "stops routine training on exam day"]
+    },
+    {
+      "name": "subtype focus and fresh transfer",
+      "user": "匹配题独立做对3道，连续4道仔细阅读主旨题都选了局部例子。重新读档，先帮我校准一个判据，再从计划里抽新题。",
+      "expect": ["returns the careful-reading subtype from persisted plan", "counts distinct first attempts", "waits for the learner to restate a repair before new practice", "does not mark the new question done"]
+    },
+    {
+      "name": "CET-4 audio replaced at the same path",
+      "user": "四级短篇新闻的音频被同名替换，还能播放。请核对原题明天的回测，不要提交或重绑。",
+      "expect": ["checks hash rather than pathname", "does not deliver the changed file or count a new attempt", "shows the original review date while flagging audio unavailable"]
+    },
+    {
+      "name": "CET-6 rewrite links the correct draft",
+      "user": "同一道六级写作先后写了两篇独立稿，这篇是第一稿看过反馈后的重写。用原判据复评并留档，我下次只按档案恢复。",
+      "expect": ["uses one criterion with evidence", "links the rewrite to the first draft by ID", "counts the rewrite as assisted and excludes full text without permission", "recovers the link and criterion from the draft history"]
     }
   ]
 }

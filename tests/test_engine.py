@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -8,7 +9,7 @@ import sys
 import tempfile
 import unittest
 import wave
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -172,6 +173,7 @@ class EngineFlowTests(unittest.TestCase):
             self.workspace, item_id=item["item_id"], response="B", minutes=1
         )
         self.assertEqual(result["judgment_basis"], "verified_key")
+        self.assertEqual(result["transcript_reveal"], "Access matters most.")
         service.add_checkpoint(
             self.workspace,
             kind="mock",
@@ -325,6 +327,20 @@ class EngineFlowTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "unknown_schema")
         self.assertTrue(list(foreign_state.parent.glob("state.sqlite3.v0.*.bak")))
 
+    def test_cli_emits_utf8_json_on_ascii_console(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "cet.py"
+        cmd = [sys.executable, "-B", str(script), "--workspace", str(self.workspace)]
+        env = {**os.environ, "PYTHONIOENCODING": "ascii"}
+        missing = subprocess.run(
+            cmd + ["status"], env=env, capture_output=True, check=False
+        )
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("档案", json.loads(missing.stdout)["message"])
+        subprocess.check_output(cmd + ["init", "--level", "4"], env=env)
+        day = json.loads(subprocess.check_output(cmd + ["today"], env=env))
+        self.assertTrue(day["ok"])
+        self.assertIn("诊断", day["data"]["tasks"][0]["title"])
+
     def test_json_cli_smoke(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "cet.py"
         proc = subprocess.run(
@@ -367,6 +383,116 @@ class EngineFlowTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(json.loads(invalid.stdout)["code"], "invalid_arguments")
+
+    def test_drill_ranks_due_recent_error_and_fresh_candidates(self) -> None:
+        service.init_profile(self.workspace, level=4)
+
+        def add(prompt: str, section: str = "reading") -> str:
+            if section == "reading":
+                prompt += "\nA. Library\nB. Café\nC. Station\nD. Office"
+            return service.add_item(
+                self.workspace,
+                section=section,
+                subtype="careful_reading" if section == "reading" else "essay",
+                prompt=prompt,
+            )["item_id"]
+
+        corrected = add("前一次错误，最近一次做对的阅读题")
+        wrong = add("最近一次做错的阅读题")
+        fresh = add("没有作答记录的阅读题")
+        other = add("历史写作题", "writing")
+        stamp = local_date().isoformat()
+        with sqlite3.connect(db_path(self.workspace)) as connection:
+            connection.executemany(
+                """INSERT INTO attempts(id,item_id,made_at,result,minutes,judgment_basis)
+                   VALUES(?,?,?,?,1,'coach_review')""",
+                [
+                    ("first", corrected, stamp, "wrong"),
+                    ("second", corrected, stamp, "correct"),
+                    ("third", wrong, stamp, "wrong"),
+                    ("other", other, stamp, "wrong"),
+                ],
+            )
+        self.assertEqual(
+            service.drill(self.workspace, section="reading")["item_id"], wrong
+        )
+        self.assertEqual(
+            service.drill(self.workspace, section="reading", fresh=True)["item_id"],
+            fresh,
+        )
+        with sqlite3.connect(db_path(self.workspace)) as connection:
+            connection.execute(
+                "INSERT INTO review_cards(item_id,due_at,scheduler,updated_at) VALUES(?,?,?,?)",
+                (corrected, stamp, "fixed", stamp),
+            )
+        self.assertEqual(
+            service.drill(self.workspace, section="reading")["item_id"], corrected
+        )
+
+    def test_reading_drill_only_loads_the_selected_question_body(self) -> None:
+        service.init_profile(self.workspace, level=4)
+        for index in range(5):
+            service.add_item(
+                self.workspace,
+                section="reading",
+                subtype="careful_reading",
+                prompt=f"Q{index}: Choose the correct option. A. One B. Two C. Three D. Four",
+            )
+        fetched = []
+        connect = service.connect
+
+        def track(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+
+            def inspect(cursor, values):
+                if "prompt" in {column[0] for column in cursor.description}:
+                    fetched.append(values)
+                return sqlite3.Row(cursor, values)
+
+            conn.row_factory = inspect
+            return conn
+
+        with patch.object(service, "connect", side_effect=track):
+            selected = service.drill(self.workspace, section="reading", fresh=True)
+        self.assertTrue(selected["question"])
+        self.assertEqual(len(fetched), 1)
+
+    def test_ranked_listening_drill_skips_changed_audio(self) -> None:
+        service.init_profile(self.workspace, level=4)
+        items = []
+        for name in ("original", "fallback"):
+            audio = self.root / f"{name}.wav"
+            with wave.open(str(audio), "wb") as output:
+                output.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+                output.writeframes(b"\x01\x00" * 800)
+            items.append(
+                service.add_item(
+                    self.workspace,
+                    section="listening",
+                    subtype="short_news",
+                    source_type="original",
+                    prompt=f"{name} entrance? A. West B. North C. South D. East",
+                    answer="C",
+                    answer_status="generated",
+                    evidence="Use the south entrance.",
+                    transcript="Use the south entrance.",
+                    audio_path=str(audio),
+                )["item_id"]
+            )
+        stamp = local_date().isoformat()
+        with sqlite3.connect(db_path(self.workspace)) as conn:
+            conn.execute(
+                "INSERT INTO review_cards(item_id,due_at,scheduler,updated_at) VALUES(?,?,?,?)",
+                (items[0], stamp, "fixed", stamp),
+            )
+        (self.root / "original.wav").write_bytes(b"changed")
+        result = service.drill(self.workspace, section="listening")
+        self.assertEqual(result["item_id"], items[1])
+        self.assertNotIn("transcript", result)
+        (self.root / "fallback.wav").unlink()
+        with self.assertRaises(CoachError) as exc:
+            service.drill(self.workspace, section="listening")
+        self.assertEqual(exc.exception.code, "audio_changed")
 
     def test_batch_import_is_atomic_and_targeted_review_hides_answer(self) -> None:
         service.init_profile(self.workspace, level=4)
@@ -484,6 +610,207 @@ class EngineFlowTests(unittest.TestCase):
         exam_day = service.today(self.workspace)
         self.assertEqual(exam_day["tasks"], [])
         self.assertIn("考试日", exam_day["reason"])
+
+    def test_today_updates_tasks_atomically_on_one_connection(self) -> None:
+        service.init_profile(self.workspace, level=4, weak_section="reading")
+        initial = service.today(self.workspace)["tasks"]
+        self.assertEqual(len(initial), 2)
+        completed, pending = (item["id"] for item in initial)
+        service.log_task(
+            self.workspace, task_id=completed, minutes=20, evidence="独立完成"
+        )
+        service.set_profile(self.workspace, {"weak_section": "listening"})
+        db = db_path(self.workspace)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """CREATE TRIGGER reject_maintenance BEFORE INSERT ON task_logs
+                   WHEN NEW.role='maintenance'
+                   BEGIN SELECT RAISE(ABORT,'injected failure'); END"""
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected failure"):
+            service.today(self.workspace)
+        with sqlite3.connect(db) as conn:
+            self.assertCountEqual(
+                conn.execute("SELECT id FROM task_logs").fetchall(),
+                [(completed,), (pending,)],
+            )
+            conn.execute("DROP TRIGGER reject_maintenance")
+        with patch.object(service, "connect", wraps=service.connect) as connect:
+            updated = service.today(self.workspace)
+        connect.assert_called_once_with(self.workspace)
+        current_ids = {task["id"] for task in updated["tasks"]}
+        with sqlite3.connect(db) as conn:
+            self.assertEqual(
+                dict(conn.execute("SELECT id,completed FROM task_logs")),
+                {completed: 1, **dict.fromkeys(current_ids, 0)},
+            )
+
+    def test_cached_plan_refreshes_days_and_phase_within_one_week(self) -> None:
+        exam_day = date(2030, 11, 28)
+        service.init_profile(self.workspace, level=4, exam_date=exam_day.isoformat())
+        earlier = service.plan(self.workspace, current=exam_day - timedelta(days=2))
+        later = service.plan(self.workspace, current=exam_day - timedelta(days=1))
+        self.assertEqual(earlier["week_start"], later["week_start"])
+        self.assertTrue(later["reused"])
+        self.assertEqual(later["days_remaining"], 1)
+        self.assertTrue(
+            service.today(self.workspace, current=exam_day - timedelta(days=1))["tasks"]
+        )
+        on_exam = service.today(self.workspace, current=exam_day)
+        self.assertEqual(on_exam["tasks"], [])
+        self.assertIn("考试日", on_exam["reason"])
+        after_exam = service.today(self.workspace, current=exam_day + timedelta(days=1))
+        self.assertEqual(after_exam["tasks"], [])
+        self.assertIn("已过", after_exam["reason"])
+
+    def test_v1_database_migration_backs_up_and_preserves_attempts(self) -> None:
+        service.init_profile(self.workspace, level=4)
+        item = service.add_item(
+            self.workspace,
+            section="reading",
+            subtype="careful_reading",
+            prompt="When? A. Seven B. Eight C. Nine D. Ten",
+            answer="B",
+            answer_status="verified",
+            evidence="user key",
+        )
+        service.attempt(self.workspace, item_id=item["item_id"], response="B")
+        path = self.workspace / ".cet-sprint" / "state.sqlite3"
+        with sqlite3.connect(path) as old:
+            old.execute("ALTER TABLE attempts DROP COLUMN practice_mode")
+            old.execute("ALTER TABLE checkpoints DROP COLUMN comparison_key")
+            old.execute("ALTER TABLE items DROP COLUMN audio_sha256")
+            old.execute("ALTER TABLE attempts DROP COLUMN translation_alignment_json")
+            old.execute("ALTER TABLE attempts DROP COLUMN revises_attempt_id")
+            old.execute("ALTER TABLE attempts DROP COLUMN revision_criterion")
+            old.execute("PRAGMA user_version = 1")
+        old.close()
+        self.assertEqual(
+            service.report(self.workspace)["independent_attempts"]["reading"][
+                "correct"
+            ],
+            1,
+        )
+        backups = list(path.parent.glob("state.sqlite3.v1.*.bak"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(
+                backup.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 1
+            )
+        backup.close()
+        with sqlite3.connect(path) as migrated:
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(
+                migrated.execute("SELECT practice_mode FROM attempts").fetchone()[0],
+                "independent",
+            )
+        migrated.close()
+
+    def test_cet4_listening_blocks_replaced_audio_keeps_prior_attempt(self) -> None:
+        service.init_profile(self.workspace, level=4)
+        audio = self.root / "broadcast.wav"
+
+        def write_wav(sample):
+            with wave.open(str(audio), "wb") as handle:
+                handle.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+                handle.writeframes(sample * 800)
+
+        write_wav(b"\x01\x00")
+        first_bytes = audio.read_bytes()
+        item_id = service.add_item(
+            self.workspace,
+            section="listening",
+            subtype="short_news",
+            source_type="original",
+            prompt="Which entrance? A. West B. North C. South D. East",
+            answer="C",
+            answer_status="generated",
+            evidence="Visitors should use the south entrance.",
+            transcript="Visitors should use the south entrance.",
+            audio_path=str(audio),
+        )["item_id"]
+        initial = service.drill(self.workspace, item_id=item_id)
+        self.assertNotIn("transcript", initial)
+        service.attempt(
+            self.workspace, item_id=item_id, response="C", minutes=1, event_id="first"
+        )
+        original_due = (local_date() + timedelta(days=1)).isoformat()
+
+        write_wav(b"\x20\x00")
+        for operation in (
+            lambda: service.drill(self.workspace, item_id=item_id),
+            lambda: service.attempt(
+                self.workspace, item_id=item_id, response="C", event_id="second"
+            ),
+        ):
+            with self.assertRaises(CoachError) as changed:
+                operation()
+            self.assertEqual(changed.exception.code, "audio_changed")
+        review = service.review(self.workspace, through=original_due)["items"][0]
+        self.assertFalse(review["audio_ready"])
+        self.assertEqual(review["audio_error"], "audio_changed")
+        self.assertEqual(review["due_at"], original_due)
+        self.assertEqual(service.status(self.workspace)["counts"]["attempts"], 1)
+        self.assertTrue(
+            service.attempt(
+                self.workspace, item_id=item_id, response="C", event_id="first"
+            )["duplicate"]
+        )
+        audio.write_bytes(first_bytes)
+        self.assertEqual(
+            service.drill(self.workspace, item_id=item_id)["item_id"], item_id
+        )
+        self.assertTrue(
+            service.review(self.workspace, through=original_due)["items"][0][
+                "audio_ready"
+            ]
+        )
+
+    def test_v2_audio_uses_registered_fingerprint_or_requests_rebinding(self) -> None:
+        service.init_profile(self.workspace, level=4)
+        audio = self.root / "legacy.wav"
+        with wave.open(str(audio), "wb") as handle:
+            handle.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            handle.writeframes(b"\x20\x00" * 800)
+        material = service.add_material(self.workspace, str(audio))
+        linked = service.add_item(
+            self.workspace,
+            section="listening",
+            subtype="short_news",
+            material_id=material["material_id"],
+            prompt="Where is the event? A. West B. North C. South D. East",
+            audio_path=str(audio),
+        )["item_id"]
+        loose = service.add_item(
+            self.workspace,
+            section="listening",
+            subtype="short_news",
+            prompt="When is the event? A. Monday B. Tuesday C. Friday D. Sunday",
+            audio_path=str(audio),
+        )["item_id"]
+        path = db_path(self.workspace)
+        old = sqlite3.connect(path)
+        with old:
+            old.execute("ALTER TABLE items DROP COLUMN audio_sha256")
+            old.execute("ALTER TABLE attempts DROP COLUMN translation_alignment_json")
+            old.execute("ALTER TABLE attempts DROP COLUMN revises_attempt_id")
+            old.execute("ALTER TABLE attempts DROP COLUMN revision_criterion")
+            old.execute("PRAGMA user_version = 2")
+        old.close()
+        self.assertEqual(
+            service.drill(self.workspace, item_id=linked)["item_id"], linked
+        )
+        with self.assertRaises(CoachError) as unbound:
+            service.drill(self.workspace, item_id=loose)
+        self.assertEqual(unbound.exception.code, "audio_binding_unverified")
+        self.assertTrue(
+            service.update_item(self.workspace, loose, audio_path=str(audio))[
+                "audio_ready"
+            ]
+        )
+        self.assertEqual(service.drill(self.workspace, item_id=loose)["item_id"], loose)
+        self.assertEqual(len(list(path.parent.glob("state.sqlite3.v2.*.bak"))), 1)
 
     def test_original_listening_tts_when_available(self) -> None:
         if not shutil.which("say") or not shutil.which("ffmpeg"):

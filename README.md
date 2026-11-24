@@ -1,4 +1,4 @@
-<h1 align="center">青岸计划·四六级英语考试冲刺教练</h1>
+<h1 align="center">🎧 青岸计划·四六级英语考试冲刺教练</h1>
 
 <p align="center">
   <strong>把“我今天该学什么”变成有依据、能开始、可检验的一步。</strong><br>
@@ -16,6 +16,33 @@
 社区的「零一玩家 Shadow」是一款如影随形的主角式 AI，探索以你为中心的软硬件生态。「玩家计划」从有趣的活动或比赛开始，让玩家理念落到实践。「共创广场」汇集优质项目，连接真实社会需求与高级开发玩家。
 
 这是一套以对话为入口、以本地学习记录为依据的 **CET-4 / CET-6 笔试 Skill**。你可以直接说目标、提供自己的材料、作答或描述卡点，教练会把训练结果用于下一次计划。项目不打包历年真题，不承诺分数，也不要求学生学习命令。
+
+> [!IMPORTANT]
+> 安装完整 Skill 文件夹即可开始对话训练。保存档案和运行本地命令需要宿主提供 Python 3.12–3.14 与工作区权限。
+
+## V1.8.0 SQLite 档案恢复
+
+数据库损坏时，使用经确认的完整 SQLite 备份。引擎先检查结构、完整性和外键，再原子恢复并保存损坏原件。原有错题、复习排期和写译关联可以在新会话中逐项核对。
+
+## V1.7.0 翻译逐点复评
+
+保存可定位的原文和译文摘句，沿同一组信息点复评重译。读档可以直接区分修复、退步和仍待处理的点，适合检查限定范围、否定、数量和条件变化。
+
+## V1.6.0 写译重写记录
+
+写译初稿可以登记一条改稿判据，之后以确切记录 ID 关联重写。同题有多篇独立作答时，每份重写仍能读回原稿和判据。复评查询返回短证据和反馈，并标明独立稿与辅助重写。数据库会在首次打开旧档时先备份再迁移。
+
+## V1.5.0 听力录音绑定校验
+
+音频绑定时保存文件指纹。若同名文件被覆盖，派题和作答会暂停，复习列表仍显示到期日及音频异常原因。旧 SQLite 档案升级前备份。旧版已登记的同路径材料可用其历史指纹核对，缺少历史指纹的音频需复核后重新绑定。
+
+## V1.4.0 子题型主攻与换题复测
+
+计划会在证据足够时给出要主攻的子题型和重复错因。例如同样是阅读，匹配题表现稳定、仔细阅读常把例子当成主旨，今天就练主旨判断。先说清判据，再按档案抽没做过的同题型题。复盘能查看这个错因影响了几道不同的题，以及哪天该回访旧题。
+
+## V1.3.0 独立作答与真实模考
+
+有提示、看过脚本或跟着示例重写的记录单列为辅助训练。听力脚本在提交作答后可见，后续用新题检验迁移。异日异卷、作答条件相近的检查点才进入原始正确率对照。每日倒计时会按当天计算，进入考试日后停止常规训练。读取旧档时会先备份 SQLite，再升级结构。
 
 ## 先看它如何工作
 
@@ -113,24 +140,25 @@ flowchart LR
 
 ## 安装与使用
 
-要求 Python 3.12+ 和 [`uv`](https://docs.astral.sh/uv/)。新安装时把仓库放入 Codex 的 Skill 目录：
+将完整的 `cet-sprint-coach/` 文件夹放到所用 Agent 的 Skill 目录，或使用 Skills CLI 安装到当前项目：
 
 ```bash
-git clone https://github.com/XiaoSiKe/cet-sprint-coach.git ~/.codex/skills/cet-sprint-coach
-uv sync --project ~/.codex/skills/cet-sprint-coach --python 3.12 --frozen
+npx skills add XiaoSiKe/cet-sprint-coach --skill cet-sprint-coach -y
 ```
 
-已有同名目录时先核对来源，不要覆盖其中的个人修改。安装后在 Codex 中使用 `$cet-sprint-coach` 或直接说“帮我准备四级/六级”。学习记录按所选工作区写入 `.cet-sprint/state.sqlite3`；Skill 目录保存程序与参考文件。原始资料不会被引擎移动或上传；若通过在线模型对话，聊天内容仍遵循所用服务的传输方式，不能把“本地账本”误说成“全程离线”。
+新建对话后可以直接说“请用 cet-sprint-coach 带我练一题四级阅读”。带 Python 3.12–3.14 的宿主可调用本地引擎。仅有对话或附件时，从用户已经贴出的题面、稿件或成绩开始。学习记录按所选工作区写入 `.cet-sprint/state.sqlite3`。引擎在本地读取原始资料，在线对话内容遵循所用宿主的传输方式。
 
 ### 引擎命令供 Agent 调用
 
+用宿主已有的兼容 Python。安装路径和学习档案路径分别传入。
+
 ```bash
-SKILL_ROOT="$HOME/.codex/skills/cet-sprint-coach"
-WORKSPACE="$HOME/Documents/my-cet-study"
-uv run --project "$SKILL_ROOT" --frozen python "$SKILL_ROOT/scripts/cet.py" --workspace "$WORKSPACE" init --level 4
-uv run --project "$SKILL_ROOT" --frozen python "$SKILL_ROOT/scripts/cet.py" --workspace "$WORKSPACE" today
-uv run --project "$SKILL_ROOT" --frozen python "$SKILL_ROOT/scripts/cet.py" --workspace "$WORKSPACE" efficiency --days 7
+python3.12 "SKILL_ROOT/scripts/cet.py" --workspace "WORKSPACE" init --level 4
+python3.12 "SKILL_ROOT/scripts/cet.py" --workspace "WORKSPACE" today
+python3.12 "SKILL_ROOT/scripts/cet.py" --workspace "WORKSPACE" efficiency --days 7
 ```
+
+PDF 文字提取和 FSRS 需要可选依赖。如果选择用 `uv` 配置它们，运行一次 `uv sync --project "SKILL_ROOT" --python 3.12 --frozen`，之后直接使用该环境的解释器。
 
 | 命令 | 主要用途 |
 |---|---|
