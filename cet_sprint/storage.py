@@ -9,7 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
 SECTIONS = ("listening", "reading", "writing", "translation", "vocab")
 OBJECTIVE_SUBTYPES = {
     "short_news",
@@ -48,7 +48,7 @@ class CoachError(Exception):
 
 
 def now_iso() -> str:
-    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def local_date() -> date:
@@ -156,7 +156,8 @@ CREATE TABLE IF NOT EXISTS items (
   transcript TEXT,
   source_type TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  audio_sha256 TEXT
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY,
@@ -168,7 +169,11 @@ CREATE TABLE IF NOT EXISTS attempts (
   error_tag TEXT,
   judgment_basis TEXT NOT NULL,
   feedback TEXT,
-  evidence TEXT
+  evidence TEXT,
+  practice_mode TEXT NOT NULL DEFAULT 'independent' CHECK (practice_mode IN ('independent','assisted')),
+  revision_criterion TEXT,
+  revises_attempt_id TEXT REFERENCES attempts(id),
+  translation_alignment_json TEXT
 );
 CREATE TABLE IF NOT EXISTS review_cards (
   item_id TEXT PRIMARY KEY REFERENCES items(id),
@@ -192,7 +197,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   score_reading INTEGER,
   score_writing_translation INTEGER,
   source TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  comparison_key TEXT
 );
 CREATE TABLE IF NOT EXISTS plans (
   week_start TEXT PRIMARY KEY,
@@ -237,9 +243,13 @@ def connect(workspace: Path, create: bool = False) -> sqlite3.Connection:
         root.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.Error:
+        conn.close()
+        raise
     if version > SCHEMA_VERSION:
         conn.close()
         raise CoachError(
@@ -248,32 +258,57 @@ def connect(workspace: Path, create: bool = False) -> sqlite3.Connection:
             "使用创建该档案的新版 Skill。",
         )
     if version < SCHEMA_VERSION:
-        if exists:
-            backup = (
-                root
-                / f"state.sqlite3.v{version}.{datetime.now().astimezone().strftime('%Y%m%d%H%M%S')}.bak"
-            )
-            with sqlite3.connect(backup) as target:
-                conn.backup(target)
-            if version == 0:
-                tables = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                    )
-                ]
-                if tables:
-                    conn.close()
-                    raise CoachError(
-                        "unknown_schema",
-                        "发现未标版本的数据库，未做自动迁移。",
-                        f"原库已备份为 {backup.name}；先核对来源，再使用适配的迁移器。",
-                    )
+        backup = None
         try:
-            conn.executescript(SCHEMA)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.commit()
-        except sqlite3.Error:
+            if exists:
+                stamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S%f")
+                backup = root / f"state.sqlite3.v{version}.{stamp}.bak"
+                target = sqlite3.connect(backup)
+                try:
+                    conn.backup(target)
+                finally:
+                    target.close()
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0:
+                    tables = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                    if tables:
+                        raise CoachError(
+                            "unknown_schema",
+                            "发现未标版本的数据库，未做自动迁移。",
+                            f"请核对档案来源。备份：{backup.name if backup else '无'}。",
+                        )
+                    for statement in SCHEMA.split(";"):
+                        if statement.strip():
+                            conn.execute(statement)
+                elif version == 1:
+                    conn.execute(
+                        "ALTER TABLE attempts ADD COLUMN practice_mode TEXT NOT NULL "
+                        "DEFAULT 'independent' CHECK (practice_mode IN ('independent','assisted'))"
+                    )
+                    conn.execute(
+                        "ALTER TABLE checkpoints ADD COLUMN comparison_key TEXT"
+                    )
+                    conn.execute("DELETE FROM plans")
+                if version in {1, 2}:
+                    conn.execute("ALTER TABLE items ADD COLUMN audio_sha256 TEXT")
+                if version in {1, 2, 3}:
+                    conn.execute(
+                        "ALTER TABLE attempts ADD COLUMN revision_criterion TEXT"
+                    )
+                    conn.execute(
+                        "ALTER TABLE attempts ADD COLUMN revises_attempt_id TEXT REFERENCES attempts(id)"
+                    )
+                if version in {1, 2, 3, 4}:
+                    conn.execute(
+                        "ALTER TABLE attempts ADD COLUMN translation_alignment_json TEXT"
+                    )
+                if version < SCHEMA_VERSION:
+                    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except (sqlite3.Error, CoachError):
             conn.close()
             raise
     conn.execute("PRAGMA journal_mode = WAL")

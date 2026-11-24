@@ -1,3 +1,3 @@
 """Local CET-4/CET-6 coaching state engine."""
 
-__version__ = "1.2.0"
+__version__ = "1.8.0"

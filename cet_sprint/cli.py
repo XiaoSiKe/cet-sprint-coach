@@ -10,21 +10,28 @@ from pathlib import Path
 from typing import Any
 
 from . import service
+from .recovery import CORRUPTION_CODES, restore_database
 from .storage import CoachError
+
+
+def emit_json(payload: dict[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+    else:
+        buffer.write(text.encode("utf-8"))
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "code": "invalid_arguments",
-                    "message": message,
-                    "recovery": "运行 --help 查看命令和参数。",
-                },
-                ensure_ascii=False,
-            )
+        emit_json(
+            {
+                "ok": False,
+                "code": "invalid_arguments",
+                "message": message,
+                "recovery": "运行 --help 查看命令和参数。",
+            }
         )
         raise SystemExit(2)
 
@@ -192,6 +199,14 @@ def make_parser() -> argparse.ArgumentParser:
     )
     drill.add_argument("--subtype")
     drill.add_argument("--item-id", help="Select an exact due-review item")
+    drill.add_argument(
+        "--focus",
+        action="store_true",
+        help="Use the current plan's section and subtype",
+    )
+    drill.add_argument(
+        "--fresh", action="store_true", help="Select only items without an attempt"
+    )
     attempt = commands.add_parser(
         "attempt", help="Record actual response; only then reveal source answer"
     )
@@ -209,6 +224,28 @@ def make_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--save-response", action="store_true")
     attempt.add_argument("--rating", choices=("easy",))
     attempt.add_argument("--event-id")
+    attempt.add_argument(
+        "--criterion", help="One writing or translation revision criterion"
+    )
+    attempt.add_argument(
+        "--revises", help="Record a guided rewrite linked to this reviewed draft"
+    )
+    attempt.add_argument(
+        "--alignment-file", help="UTF-8 JSON array of translation evidence points"
+    )
+    revisions = commands.add_parser(
+        "revisions", help="Read writing feedback and draft links"
+    )
+    revisions.add_argument("--item-id", required=True)
+    attempt.add_argument(
+        "--assisted",
+        action="store_true",
+        help="Record hinted or transcript-assisted practice",
+    )
+    restore = commands.add_parser(
+        "restore", help="Restore a confirmed SQLite backup into a damaged workspace"
+    )
+    restore.add_argument("--backup", required=True)
     checkpoint = commands.add_parser(
         "checkpoint", help="Keep official score separate from mock raw accuracy"
     )
@@ -226,8 +263,12 @@ def make_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--score-reading", type=int)
     checkpoint.add_argument("--score-writing-translation", type=int)
     checkpoint.add_argument("--event-id")
+    checkpoint.add_argument(
+        "--comparison-key", help="Comparable mock format and conditions label"
+    )
     review = commands.add_parser("review", help="Read due review metadata")
     review.add_argument("--limit", type=int, default=20)
+    review.add_argument("--through", help="List reviews due on or before YYYY-MM-DD")
     report = commands.add_parser(
         "report", help="Separate execution, answers, errors and checkpoints"
     )
@@ -396,11 +437,33 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.command == "drill":
         return service.drill(
-            workspace, section=args.section, subtype=args.subtype, item_id=args.item_id
+            workspace,
+            section=args.section,
+            subtype=args.subtype,
+            item_id=args.item_id,
+            fresh=args.fresh,
+            use_focus=args.focus,
         )
     if args.command == "attempt":
         response = _text_arg(args.response, args.response_file, "作答")
         feedback = _text_arg(args.feedback, args.feedback_file, "反馈")
+        alignment = None
+        if args.alignment_file is not None:
+            content = _text_arg(None, args.alignment_file, "翻译逐点证据")
+            try:
+                alignment = json.loads(content)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CoachError(
+                    "invalid_alignment_json",
+                    "逐点证据文件须为 JSON 数组。",
+                    "核对文件内容。",
+                ) from exc
+            if not isinstance(alignment, list):
+                raise CoachError(
+                    "invalid_alignment_json",
+                    "逐点证据文件须为 JSON 数组。",
+                    "核对文件内容。",
+                )
         return service.attempt(
             workspace,
             item_id=args.item_id,
@@ -413,7 +476,15 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             save_response=args.save_response,
             rating=args.rating,
             event_id=args.event_id,
+            practice_mode="assisted" if args.assisted else "independent",
+            criterion=args.criterion,
+            revises=args.revises,
+            alignment=alignment,
         )
+    if args.command == "revisions":
+        return service.revision_history(workspace, item_id=args.item_id)
+    if args.command == "restore":
+        return restore_database(workspace, args.backup)
     if args.command == "checkpoint":
         return service.add_checkpoint(
             workspace,
@@ -429,9 +500,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             score_reading=args.score_reading,
             score_writing_translation=args.score_writing_translation,
             event_id=args.event_id,
+            comparison_key=args.comparison_key,
         )
     if args.command == "review":
-        return service.review(workspace, limit=args.limit)
+        return service.review(workspace, limit=args.limit, through=args.through)
     if args.command == "report":
         return service.report(workspace, days=args.days)
     if args.command == "efficiency":
@@ -447,45 +519,45 @@ def main(argv: list[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     try:
         result = dispatch(args)
-        print(json.dumps({"ok": True, "data": result}, ensure_ascii=False))
+        emit_json({"ok": True, "data": result})
         return 0
     except CoachError as exc:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "code": exc.code,
-                    "message": exc.message,
-                    "recovery": exc.recovery,
-                },
-                ensure_ascii=False,
-            )
+        emit_json(
+            {
+                "ok": False,
+                "code": exc.code,
+                "message": exc.message,
+                "recovery": exc.recovery,
+            }
         )
         return 2
     except (OSError, sqlite3.Error) as exc:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "code": "storage_error",
-                    "message": str(exc),
-                    "recovery": "检查学习目录权限与磁盘状态；不要删除原档案，可先从备份恢复。",
-                },
-                ensure_ascii=False,
-            )
+        corrupt = (
+            isinstance(exc, sqlite3.Error)
+            and (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in CORRUPTION_CODES
+        )
+        recovery = (
+            "保留损坏档案；获得完整备份和恢复授权后使用 restore --backup。"
+            if corrupt
+            else "检查学习目录权限和磁盘状态，保留现有档案。"
+        )
+        emit_json(
+            {
+                "ok": False,
+                "code": "storage_error",
+                "message": str(exc),
+                "recovery": recovery,
+            }
         )
         return 3
     except Exception:  # noqa: BLE001 - keep the JSON protocol intact on unexpected failures
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "code": "internal_error",
-                    "message": "引擎出现未预期错误，本次操作不能视为已保存。",
-                    "recovery": "保留 .cet-sprint/ 与原材料，记录操作命令并检查版本；不要删除数据库。",
-                },
-                ensure_ascii=False,
-            )
+        emit_json(
+            {
+                "ok": False,
+                "code": "internal_error",
+                "message": "引擎出现未预期错误，本次操作不能视为已保存。",
+                "recovery": "保留 .cet-sprint/ 与原材料，记录操作命令并检查版本。",
+            }
         )
         return 4
 
